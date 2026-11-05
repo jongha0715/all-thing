@@ -2,7 +2,7 @@
 /* POST /api/login  { id, pw }  →  { token }
    비밀번호는 서버에서만 확인하고, 맞으면 Firebase 로그인용 토큰을 줘요.
    같은 아이디로 10분 안에 5번 틀리면 5분 동안 막아요. */
-const fb = require('./_lib/fb');https://github.com/jongha0715/all-thing/blob/main/login.js
+const fb = require('./_lib/fb');
 const { handler, httpErr, validId, txn, USERS } = require('./_lib/http');
 const { SECRET_AUTH, verifySecret, migrateSecrets } = require('./_lib/pw');
 
