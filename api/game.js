@@ -20,7 +20,11 @@ const GAME_RESET_KEY = { salt:'allthing-game-reset-7f3a91c2', hash:'9395d43da3e9
 const fmtWon = n => Math.round(n || 0).toLocaleString('ko-KR') + '원';
 
 async function loadCtrl(d){ return E.ctrlOf((await d.ref(CONTROL).once('value')).val()); }
-async function loadEvents(d){ return (await d.ref(EVENTS).once('value')).val() || []; }
+// 일정 목록은 휴일 판단에만 필요해서, 정말 필요할 때(시세 진행·수업 중 매수 확인) 한 번만 읽어요
+function lazyEvents(d){
+  let p = null;
+  return () => (p = p || d.ref(EVENTS).once('value').then(s => s.val() || []));
+}
 function logRef(d, ctrl){ return d.ref('allthing/allthing-game/log/' + (ctrl.season || 's1')); }
 async function gameLog(d, ctrl, uid, entry){
   try{ await logRef(d, ctrl).push(Object.assign({ uid, at: Date.now() }, entry)); }catch(e){ console.error('log', e); }
@@ -30,26 +34,39 @@ function fromLegacy(m){
   return { tick: m.tick, ver: (m.ver || 0) + 1, prices: m.prices, prev: m.prev || m.prices, history: m.history || {},
            trend: m.trend || {}, news: m.news || [], arcs: m.arcs || {}, published: m.published || {} };
 }
-async function publish(d, eng){
+/* 공개용 시세 올리기 — 바뀐 부분만 보내요.
+   (친구들 기기는 이 노드를 실시간으로 보고 있어서, 통째로 다시 쓰면 기사 본문까지 매번 전부 다시 받아요) */
+async function publish(d, eng, newsChanged){
   if(!eng) return;
-  const meta = (await d.ref(MARKET + '/ver').once('value')).val();
-  const pv = (await d.ref(MARKET + '/pv').once('value')).val();
-  if(pv === 2 && typeof meta === 'number' && meta >= (eng.ver || 0)) return;
-  await d.ref(MARKET).set(Object.assign(E.publicMarket(eng), { pv: 2 }));
+  const [verS, pvS] = await Promise.all([d.ref(MARKET + '/ver').once('value'), d.ref(MARKET + '/pv').once('value')]);
+  const ver = verS.val(), pv = pvS.val();
+  if(pv === 2 && typeof ver === 'number' && ver >= (eng.ver || 0)) return;
+  const pub = Object.assign(E.publicMarket(eng), { pv: 2 });
+  if(pv !== 2 || typeof ver !== 'number' || newsChanged !== false){ await d.ref(MARKET).set(pub); return; }
+  const patch = Object.assign({}, pub);
+  delete patch.news;                      // 기사 목록이 그대로면 다시 보내지 않아요
+  if(!patch.active) patch.active = null;  // 진행 중인 뉴스가 없으면 지워요
+  await d.ref(MARKET).update(patch);
 }
-/* 시세를 지금 시각까지 진행하고, 최신 엔진 값을 돌려줘요. 여러 명이 동시에 불러도 한 번만 진행돼요. */
-async function advance(d, events){
+function newsKey(m){ return m && m.news ? (Array.isArray(m.news) ? m.news : Object.values(m.news)).map(n => n && n.id).join(',') : ''; }
+/* 시세를 지금 시각까지 진행해요. 여러 명이 동시에 불러도 한 번만 진행돼요.
+   이미 최신이면 아주 작은 값(tick) 하나만 읽고 끝나요 — 대부분의 요청은 여기서 끝나요. */
+async function advance(d, ev){
   const target = E.tickNow();
-  const [flowS, tickS] = await Promise.all([d.ref(FLOW).once('value'), d.ref(ENGINE + '/tick').once('value')]);
+  const tick = (await d.ref(ENGINE + '/tick').once('value')).val();
+  if(typeof tick === 'number' && tick >= target) return null;
+  const [flowS, events] = await Promise.all([d.ref(FLOW).once('value'), ev()]);
   const flow = flowS.val() || {};
   let seed = null;
-  if(tickS.val() == null){
+  if(tick == null){
     const legacy = (await d.ref(MARKET).once('value')).val();
     if(legacy && legacy.prices) seed = legacy; // 예전 구조(정답이 공개돼 있던 시세)에서 옮겨오기
   }
+  let baseNews = null;
   const res = await txn(d.ref(ENGINE), cur => {
     let base = cur, fromSeed = false;
     if(!base && seed){ base = fromLegacy(seed); fromSeed = true; }
+    baseNews = newsKey(base);
     const out = E.advanceMarket(base, target, flow, events);
     if(out === undefined) return fromSeed ? base : undefined;
     return out;
@@ -61,29 +78,40 @@ async function advance(d, events){
     })));
   }
   if(seed) await d.ref(LEGACY_FLOW).set(null);
-  await publish(d, eng);
+  await publish(d, eng, (seed || !res.committed) ? true : newsKey(eng) !== baseNews);
   return eng;
 }
 async function readEngine(d){ return (await d.ref(ENGINE).once('value')).val(); }
+async function readEnginePart(d, sub){ return (await d.ref(ENGINE + '/' + sub).once('value')).val(); }
+// 지금 가격 하나만 필요할 때: 방금 진행했으면 그 값, 아니면 그 종목 가격만 읽어요
+async function currentPrice(d, eng, stockId){
+  if(eng && eng.prices) return eng.prices[stockId];
+  return readEnginePart(d, 'prices/' + stockId);
+}
 function recordFlow(d, stockId, won){
   return txn(d.ref(FLOW + '/' + stockId), cur => (cur || 0) + Math.round(won));
 }
 function playerRef(d, uid){ return d.ref(PLAYERS + '/' + uid); }
 
 /* ---------- 접속할 때·30분마다: 지원금, 예전 아이템 환불, 자동 손절·익절 ---------- */
-async function doSync(d, ctx, ctrl, events){
+async function doSync(d, ctx, ctrl, ev){
   const messages = [];
-  const eng = await advance(d, events);
+  const advanced = await advance(d, ev);
   const today = E.todayStr();
+  // 지갑을 먼저 보고, 꼭 필요한 시세 정보만 읽어요
+  const pNow = (await playerRef(d, ctx.uid).once('value')).val();
+  const sums = (pNow && pNow.summaries) || {};
+  const needNews = Object.keys(sums).length > 0 && (advanced || Object.keys(sums).some(k => typeof sums[k] !== 'object'));
+  const news = advanced ? advanced.news : (needNews ? await readEnginePart(d, 'news') : null);
   const newsById = {};
-  ((eng && eng.news) ? (Array.isArray(eng.news) ? eng.news : Object.values(eng.news)) : []).forEach(n => { if(n && n.node) newsById[n.id] = n; });
+  ((news) ? (Array.isArray(news) ? news : Object.values(news)) : []).forEach(n => { if(n && n.node) newsById[n.id] = n; });
   let created = false, granted = false, refund = 0;
   const r1 = await txn(playerRef(d, ctx.uid), cur => {
     created = false; granted = false; refund = 0;
     if(!cur){ created = true; return E.playerDefaults(); }
     let changed = false;
     // 예전 버전에서 연 요약(값이 1)은 새 형식으로 바꿔 주고, 정리된 기사의 요약은 지워요
-    if(cur.summaries){
+    if(cur.summaries && news){
       const next = {};
       Object.keys(cur.summaries).forEach(k => {
         const v = cur.summaries[k];
@@ -106,6 +134,11 @@ async function doSync(d, ctx, ctrl, events){
     if(refund){ messages.push('힌트 아이템이 사라져서, 안 쓴 힌트 값 ' + fmtWon(refund) + '을 돌려드렸어요.'); await gameLog(d, ctrl, ctx.uid, { type:'refund', amount: refund }); }
   }
   // 자동 손절·익절: 조건을 처음 만족한 30분 칸의 가격으로 팔아요 (앱을 늦게 열어도 결과가 같아요)
+  let eng = advanced;
+  if(!eng && pNow && pNow.orders){
+    const [tick, history] = await Promise.all([readEnginePart(d, 'tick'), readEnginePart(d, 'history')]);
+    if(tick != null && history) eng = { tick, history };
+  }
   if(eng){
     const done = [];
     const r2 = await txn(playerRef(d, ctx.uid), cur => {
@@ -139,16 +172,18 @@ async function doSync(d, ctx, ctrl, events){
 }
 
 /* ---------- 매수·매도 ---------- */
-async function doTrade(d, ctx, ctrl, events, b){
+async function doTrade(d, ctx, ctrl, ev, b){
   const side = b.side === 'sell' ? 'sell' : 'buy';
   const stock = E.stockInfo(String(b.stock || ''));
   if(!stock) throw httpErr(400, '없는 종목이에요.');
   const qty = Math.floor(Number(b.qty));
   if(!(qty > 0) || qty > 100000000) throw httpErr(400, '수량을 입력해주세요.');
-  const st = E.marketStatus(Date.now(), events);
-  if(!st.open && side === 'buy') throw httpErr(400, '수업 시간에는 매수할 수 없어요 (매도는 가능해요). ' + st.reopen + '에 다시 열려요.');
-  const eng = await advance(d, events);
-  const price = eng && eng.prices ? eng.prices[stock.id] : 0;
+  if(side === 'buy'){
+    const st = E.marketStatus(Date.now(), await ev());
+    if(!st.open) throw httpErr(400, '수업 시간에는 매수할 수 없어요 (매도는 가능해요). ' + st.reopen + '에 다시 열려요.');
+  }
+  const eng = await advance(d, ev);
+  const price = await currentPrice(d, eng, stock.id);
   if(!(price > 0)) throw httpErr(503, '시세를 확인할 수 없어요.');
   const fill = E.execPrice(side, price, qty);
   let err = '';
@@ -214,11 +249,12 @@ async function doBuyItem(d, ctx, ctrl, b){
 }
 
 /* ---------- 자동 손절·익절 예약 ---------- */
-async function doPlaceOrder(d, ctx, ctrl, events, b){
+async function doPlaceOrder(d, ctx, ctrl, ev, b){
   const stock = E.stockInfo(String(b.stock || ''));
   if(!stock) throw httpErr(400, '없는 종목이에요.');
-  const eng = await advance(d, events);
-  const now = eng && eng.prices ? eng.prices[stock.id] : 0;
+  const eng = await advance(d, ev);
+  const now = await currentPrice(d, eng, stock.id);
+  const engTick = eng ? eng.tick : await readEnginePart(d, 'tick');
   if(!(now > 0)) throw httpErr(503, '시세를 확인할 수 없어요.');
   const kind = b.kind === 'take' ? 'take' : 'stop';
   const trigger = Math.round(Number(b.trigger || 0) / 10) * 10;
@@ -237,7 +273,7 @@ async function doPlaceOrder(d, ctx, ctrl, events, b){
     placed = q;
     cur.items.autoOrder -= 1;
     cur.orders = cur.orders || {};
-    cur.orders['o' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)] = { stock: stock.id, kind, trigger, qty: q, tick: eng.tick, at: Date.now() };
+    cur.orders['o' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6)] = { stock: stock.id, kind, trigger, qty: q, tick: engTick, at: Date.now() };
     return cur;
   });
   if(err) throw httpErr(400, err);
@@ -264,8 +300,8 @@ async function doCancelOrder(d, ctx, ctrl, b){
 /* ---------- 뉴스 요약 ---------- */
 async function doUseSummary(d, ctx, ctrl, b){
   const newsId = String(b.newsId || '');
-  const eng = await readEngine(d);
-  const news = eng ? (Array.isArray(eng.news) ? eng.news : Object.values(eng.news || {})).filter(Boolean) : [];
+  const raw = await readEnginePart(d, 'news');
+  const news = raw ? (Array.isArray(raw) ? raw : Object.values(raw)).filter(Boolean) : [];
   const n = news.find(x => x.id === newsId);
   if(!n || !n.node) throw httpErr(404, '요약할 수 없는 기사예요. (이미 정리된 기사일 수 있어요)');
   const liveIds = new Set(news.map(x => x.id));
@@ -290,7 +326,7 @@ async function doUseSummary(d, ctx, ctrl, b){
 }
 
 /* ---------- 운영자 기능 ---------- */
-async function doControl(d, ctrl, events, b){
+async function doControl(d, ctrl, ev, b){
   const op = String(b.op || '');
   const id = String(b.id || '');
   const before = ctrl;
@@ -308,8 +344,8 @@ async function doControl(d, ctrl, events, b){
   if(!E.marketRunning(before) && E.marketRunning(after)){
     const r = await d.ref(ENGINE).transaction(cur => cur === null ? null : E.fastForward(cur, E.tickNow()));
     const eng = r.snapshot.val();
-    if(eng) await publish(d, eng);
-    else await advance(d, events);
+    if(eng) await publish(d, eng, false);
+    else await advance(d, ev);
   }
   return { control: after };
 }
@@ -337,7 +373,7 @@ module.exports = handler(async (req, b) => {
 
   if(action === 'control' || action === 'reset' || action === 'orphans' || action === 'cleanup'){
     requireAdmin(ctx);
-    if(action === 'control') return doControl(d, ctrl, await loadEvents(d), b);
+    if(action === 'control') return doControl(d, ctrl, lazyEvents(d), b);
     if(action === 'reset') return doReset(d, ctrl, b);
     const orphans = await findOrphans(d);
     if(action === 'orphans') return { orphans };
@@ -348,10 +384,10 @@ module.exports = handler(async (req, b) => {
   }
 
   if(!E.canPlay(ctrl, ctx.uid, ctx.isAdmin)) throw httpErr(403, '게임이 잠겨 있어요.');
-  if(action === 'sync') return doSync(d, ctx, ctrl, await loadEvents(d));
-  if(action === 'trade') return doTrade(d, ctx, ctrl, await loadEvents(d), b);
+  if(action === 'sync') return doSync(d, ctx, ctrl, lazyEvents(d));
+  if(action === 'trade') return doTrade(d, ctx, ctrl, lazyEvents(d), b);
   if(action === 'buyItem') return doBuyItem(d, ctx, ctrl, b);
-  if(action === 'placeOrder') return doPlaceOrder(d, ctx, ctrl, await loadEvents(d), b);
+  if(action === 'placeOrder') return doPlaceOrder(d, ctx, ctrl, lazyEvents(d), b);
   if(action === 'cancelOrder') return doCancelOrder(d, ctx, ctrl, b);
   if(action === 'useSummary') return doUseSummary(d, ctx, ctrl, b);
   throw httpErr(400, '알 수 없는 요청이에요.');
