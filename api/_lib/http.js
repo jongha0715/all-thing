@@ -29,9 +29,11 @@ async function requireUser(req){
   const uid = decoded.uid;
   const user = (await fb.db().ref(USERS + '/' + uid).once('value')).val();
   if(!user) throw httpErr(401, '계정을 찾을 수 없어요. 다시 로그인해주세요.');
-  return { uid, user, isAdmin: !!user.isAdmin };
+  const isSuper = !!(user.isAdmin && user.isSuper);
+  return { uid, user, isAdmin: !!user.isAdmin, isSuper };
 }
 function requireAdmin(ctx){ if(!ctx.isAdmin) throw httpErr(403, '관리자만 할 수 있어요.'); }
+function requireSuper(ctx){ if(!ctx.isSuper) throw httpErr(403, '최고 관리자만 할 수 있어요.'); }
 // Firebase 경로에 쓸 수 없는 글자(. # $ [ ] /)가 든 아이디는 거절
 function validId(id){ return typeof id === 'string' && id.length > 0 && id.length <= 40 && !/[.#$\[\]\/\s]/.test(id); }
 function handler(fn){
@@ -58,4 +60,4 @@ function txn(ref, fn){
     return out;
   });
 }
-module.exports = { httpErr, send, readBody, requireUser, requireAdmin, validId, handler, txn, USERS };
+module.exports = { httpErr, send, readBody, requireUser, requireAdmin, requireSuper, validId, handler, txn, USERS };

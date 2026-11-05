@@ -44,6 +44,15 @@ async function migrateSecrets(){
     if(hasPlain && !('pwDefault' in u)) updates[USERS + '/' + id + '/pwDefault'] = u.password === id;
     n++;
   }
+  // 최고 관리자가 아직 아무도 없으면, 처음 한 번 SUPER_ADMIN_ID(기본 20824)를 최고 관리자로 정해요.
+  // (그 뒤로 바꾸려면 Firebase 콘솔에서 allthing-users/<아이디>/isSuper 값을 직접 고치면 돼요)
+  const superId = process.env.SUPER_ADMIN_ID || '20824';
+  const hasSuper = Object.keys(users).some(id => users[id] && users[id].isSuper === true);
+  if(!hasSuper && users[superId]){
+    updates[USERS + '/' + superId + '/isSuper'] = true;
+    updates[USERS + '/' + superId + '/isAdmin'] = true;
+    n++;
+  }
   if(n) await d.ref().update(updates);
   migratedOnce = true;
   return n;
