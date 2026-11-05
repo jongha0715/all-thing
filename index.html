@@ -854,6 +854,7 @@ html[data-layout="mobile"] .home-grid{ grid-template-columns: 1fr; }
 <div id="app"></div>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-database-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
 <script>
 /* ===================== All thing — app.js ===================== */
 
@@ -915,14 +916,12 @@ function mealGroupsHtml(it){
    TRUE instant sync: the moment the admin changes the timetable/meals/exams/events/notices,
    every connected classmate's screen updates immediately, no refresh needed.
 
-   How to get a config (about 5 minutes, one time):
-   1. https://console.firebase.google.com → 새 프로젝트 만들기 (무료 Spark 요금제)
-   2. 왼쪽 메뉴 Build → Realtime Database → 데이터베이스 만들기 → "테스트 모드"로 시작
-   3. 프로젝트 설정(⚙️) → 내 앱 → 웹 앱 추가(</>) → 아무 이름이나 입력
-   4. 나오는 firebaseConfig 값을 아래 FIREBASE_CONFIG에 그대로 붙여넣기
-   5. Realtime Database → 규칙(Rules) 탭에서 우리 반끼리만 쓰는 용도이니 아래처럼 설정:
-        { "rules": { ".read": true, ".write": true } }
-      (누구나 읽고 쓸 수 있다는 뜻이라 절대 민감한 정보는 넣지 마세요.)
+   보안 구조 (2026-11 개편):
+   - 로그인은 서버(/api/login)가 비밀번호를 확인하고 Firebase 로그인 토큰을 줘요.
+   - 데이터베이스 규칙(database.rules.json)으로 잠가서, 로그인한 사람만 읽을 수 있고
+     공지·시험·시간표·계정은 관리자만, 닉네임·학번은 본인만 바꿀 수 있어요.
+   - 주식게임의 돈·주식·아이템·시세는 서버(/api/game)만 바꿀 수 있어요.
+   아래 apiKey는 원래 공개되는 값이라 괜찮아요. 진짜 비밀(서비스 계정 키)은 Vercel 환경 변수에만 있어요.
 */
 const FIREBASE_CONFIG = {
   apiKey: "AIzaSyABMhw8xbdRMKH9UNoIu5vBKNJN_a7Xju8",
@@ -933,13 +932,52 @@ const FIREBASE_CONFIG = {
   messagingSenderId: "594102091201",
   appId: "1:594102091201:web:3b3b1d6d9413da1d9f8340"
 };
-let fbDb = null;
+let fbDb = null, fbAuth = null;
 const firebaseReady = !!(FIREBASE_CONFIG.databaseURL && typeof firebase !== 'undefined');
 if(firebaseReady){
   try{
     firebase.initializeApp(FIREBASE_CONFIG);
     fbDb = firebase.database();
+    fbAuth = firebase.auth();
   }catch(e){ console.error('All thing: Firebase 초기화 실패', e); }
+}
+// 처음 한 번, 이 기기에 로그인이 남아 있는지 확인 (최대 6초 기다림)
+let authReadyPromise = null;
+function authReady(){
+  if(authReadyPromise) return authReadyPromise;
+  authReadyPromise = new Promise(resolve => {
+    if(!fbAuth){ resolve(null); return; }
+    let done = false;
+    const finish = u => { if(!done){ done = true; resolve(u); } };
+    const unsub = fbAuth.onAuthStateChanged(u => { finish(u); try{ unsub(); }catch(e){} });
+    setTimeout(() => finish(fbAuth.currentUser), 6000);
+  });
+  return authReadyPromise;
+}
+/* ---------- server API (/api/...) ----------
+   돈·주식·비밀번호처럼 조작되면 안 되는 일은 전부 서버에 부탁해요. */
+async function api(name, body){
+  const headers = { 'Content-Type': 'application/json' };
+  if(fbAuth && fbAuth.currentUser){
+    try{ headers.Authorization = 'Bearer ' + await fbAuth.currentUser.getIdToken(); }catch(e){}
+  }
+  let res, data = null;
+  try{
+    res = await fetch('/api/' + name, { method:'POST', headers, body: JSON.stringify(body || {}), cache:'no-store' });
+    data = await res.json().catch(() => null);
+  }catch(e){
+    const err = new Error('서버에 연결하지 못했어요. 인터넷 연결을 확인해주세요.'); err.status = 0; throw err;
+  }
+  if(!res.ok || !data || data.ok === false){
+    const err = new Error((data && data.error) || '서버에서 문제가 생겼어요. 잠시 후 다시 시도해주세요.');
+    err.status = res.status; throw err;
+  }
+  return data;
+}
+// 실패하면 토스트로 이유를 보여주고 null을 돌려줘요
+async function apiToast(name, body){
+  try{ return await api(name, body); }
+  catch(e){ showToast(e.message, 'err'); if(e.status === 401) forceRelogin(); return null; }
 }
 
 /* ---------- storage wrapper ----------
@@ -1241,37 +1279,9 @@ async function updateSharedEntries(key, flag, changes){
 function updateUsers(changes){ return updateSharedEntries('allthing-users', 'usersConfirmed', changes); }
 function updateTimetables(changes){ return updateSharedEntries('allthing-timetables', 'timetablesConfirmed', changes); }
 
-/* ---------- password hashing ----------
-   Passwords used to sit in the database as plain text, readable by anyone who opened the
-   database URL. Now they're stored only as a salted PBKDF2 hash. Older plain-text entries
-   keep working and are upgraded to a hash automatically the next time that person logs in.
-*/
-function randomSalt(){
-  const a = new Uint8Array(16); crypto.getRandomValues(a);
-  return Array.from(a).map(b => b.toString(16).padStart(2,'0')).join('');
-}
-async function hashPassword(pw, salt){
-  const enc = new TextEncoder();
-  const keyMat = await crypto.subtle.importKey('raw', enc.encode(pw), 'PBKDF2', false, ['deriveBits']);
-  const bits = await crypto.subtle.deriveBits({ name:'PBKDF2', salt: enc.encode(salt), iterations: 100000, hash:'SHA-256' }, keyMat, 256);
-  return Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2,'0')).join('');
-}
-async function verifyPassword(user, pw){
-  if(!user) return false;
-  if(user.pwHash && user.pwSalt){
-    try{ return (await hashPassword(pw, user.pwSalt)) === user.pwHash; }catch(e){ return false; }
-  }
-  return user.password === pw;
-}
-async function passwordFieldChanges(id, pw, isDefault){
-  const salt = randomSalt();
-  const h = await hashPassword(pw, salt);
-  return { [id+'/pwHash']: h, [id+'/pwSalt']: salt, [id+'/password']: null, [id+'/pwDefault']: !!isDefault };
-}
-async function passwordRecordFields(pw, isDefault){
-  const salt = randomSalt();
-  return { pwHash: await hashPassword(pw, salt), pwSalt: salt, pwDefault: !!isDefault };
-}
+/* ---------- passwords ----------
+   비밀번호 확인과 해시는 이제 서버(/api/login, /api/account)에서만 해요.
+   해시도 친구들이 읽을 수 없는 곳(allthing-secret)에 저장돼요. */
 
 /* ---------- constants ---------- */
 const DAYS = ['월','화','수','목','금'];
@@ -1289,17 +1299,6 @@ function classNameForId(id){
   if(!m) return null;
   return CLASS_NAMES[parseInt(m[1], 10) - 1] || null;
 }
-function defaultUsers(){
-  const names = CLASS_NAMES;
-  const users = {};
-  for(let n = 1; n <= 24; n++){
-    const id = '208' + pad2(n);
-    users[id] = { password: id, displayName: names[n-1], studentNo: id, isAdmin: id === '20824' };
-  }
-  users['00000'] = { password: '00000', displayName: '선생님', studentNo: '', isAdmin: true };
-  return users;
-}
-
 /* ---------- section config (meals / exams / events / notices share one CRUD engine) ---------- */
 const SECTIONS = {
   meals: {
@@ -1533,6 +1532,7 @@ async function toggleNotif(){
   if(perm === 'granted'){
     lsSet('notif-enabled', false, true);
     seedSeenNotices();
+    seedSeenExams();
     showToast('알림을 켰어요.');
   } else {
     showToast('알림 권한이 허용되지 않았어요.', 'err');
@@ -1554,17 +1554,48 @@ function notifyNewNotices(){
   newOnes.forEach(n => { seen.add(n.id); showNoticeNotification(n); });
   saveSeenNoticeIds(seen);
 }
-function showNoticeNotification(notice){
-  const title = '📢 All thing';
-  const body = '새로운 공지가 등록되었습니다!';
-  const fallback = () => { try{ new Notification(title, { body, icon:'icon-192.png' }); }catch(e){} };
+function showLocalNotification(title, body, tag){
+  const fallback = () => { try{ new Notification(title, { body, icon:'icon-192.png', tag }); }catch(e){} };
   if(navigator.serviceWorker && navigator.serviceWorker.ready){
     navigator.serviceWorker.ready.then(reg => {
       if(reg && reg.showNotification){
-        reg.showNotification(title, { body, icon:'icon-192.png', badge:'icon-192.png', tag:'notice-'+notice.id }).catch(fallback);
+        reg.showNotification(title, { body, icon:'icon-192.png', badge:'icon-192.png', tag }).catch(fallback);
       } else fallback();
     }).catch(fallback);
   } else fallback();
+}
+function showNoticeNotification(notice){
+  showLocalNotification('📢 All thing', '새로운 공지가 등록되었습니다!', 'notice-' + notice.id);
+}
+/* ---------- 수행평가·시험 알림 ----------
+   공지와 같은 방식이에요: 새로 등록된 수행평가·시험이 있으면 과목명을 넣어서 알려줘요.
+   (이미 있던 항목을 고친 건 알리지 않아요.) */
+function getSeenExamIds(){ return new Set(lsGet('seen-exam-ids', false, [])); }
+function saveSeenExamIds(set){ lsSet('seen-exam-ids', false, Array.from(set)); }
+function seedSeenExams(){
+  const seen = getSeenExamIds();
+  (state.exams || []).forEach(x => { if(x && x.id) seen.add(x.id); });
+  saveSeenExamIds(seen);
+}
+function notifyNewExams(){
+  if(!notifEnabled()){ seedSeenExams(); return; }
+  const seen = getSeenExamIds();
+  const newOnes = (state.exams || []).filter(x => x && x.id && !seen.has(x.id));
+  if(newOnes.length === 0) return;
+  newOnes.forEach(x => { seen.add(x.id); showExamNotification(x); });
+  saveSeenExamIds(seen);
+}
+function examNotificationText(exam){
+  const isExam = exam.kind === 'exam';
+  const subject = String(exam.subject || '').trim() || '과목 미정';
+  const title = (isExam ? '📝 ' : '📋 ') + subject + ' ' + (isExam ? '시험' : '수행평가') + ' 등록';
+  const when = exam.date ? fmtDate(exam.date) + (exam.endDate ? ' ~ ' + fmtDate(exam.endDate) : '') : '';
+  const body = '[' + subject + '] ' + (exam.title || (isExam ? '시험' : '수행평가')) + (when ? ' · ' + when : '');
+  return { title, body };
+}
+function showExamNotification(exam){
+  const t = examNotificationText(exam);
+  showLocalNotification(t.title, t.body, 'exam-' + exam.id);
 }
 
 /* ---------- notice read/unread tracking (drives the nav red-dot + NEW badges) ----------
@@ -1599,76 +1630,69 @@ async function loadField(key, shared, fallback, ms){
   if(result !== undefined) return result;
   return lsGet(key, shared, fallback);
 }
-async function init(){
-  let users, timetables, meals, exams, events, notices, session;
+function applyShortcutView(){
+  // launched via a home-screen-icon shortcut (long-press → 급식/시간표/수행평가·시험)
+  try{
+    const requested = new URLSearchParams(location.search).get('view');
+    const validShortcutViews = ['meals', 'timetable', 'exams'];
+    if(requested && validShortcutViews.includes(requested)) state.view = requested;
+  }catch(e){}
+}
+/* 로그인된 뒤에만 데이터를 읽어요 (데이터베이스 규칙상 로그인 전에는 읽을 수 없어요). */
+async function loadAllData(){
+  let users, timetables, meals, exams, events, notices;
   try{
     const results = await Promise.all([
-      fbReadStrict('allthing-users', 5000),
+      fbReadStrict('allthing-users', 6000),
       loadField('allthing-timetables', true, {}, 4000),
       loadField('allthing-meals', true, [], 4000),
       loadField('allthing-exams', true, [], 4000),
       loadField('allthing-events', true, [], 4000),
-      loadField('allthing-notices', true, [], 4000),
-      loadField('allthing-session', false, null, 4000)
+      loadField('allthing-notices', true, [], 4000)
     ]);
-    users = results[0]; timetables = results[1]; meals = results[2];
-    exams = results[3]; events = results[4]; notices = results[5]; session = results[6];
-    // users came back as a strict tri-state result — resolve it without ever guessing
-    const ur = users;
-    if(ur && ur.ok){
-      state.usersConfirmed = true;
-      if(ur.val){ users = ur.val; lsSet('allthing-users', true, users); }
-      else {
-        // server genuinely has no accounts yet (brand-new database): seed it once
-        users = lsGet('allthing-users', true, null) || defaultUsers();
-        try{ fbDb.ref('allthing/allthing-users').set(users).catch(()=>{}); }catch(e){}
-        lsSet('allthing-users', true, users);
-      }
-    } else {
-      // couldn't read the server: show whatever this device last saw, but NEVER write it back
-      users = lsGet('allthing-users', true, null);
-      if(!users && !(firebaseReady && fbDb)){ users = defaultUsers(); lsSet('allthing-users', true, users); }
-    }
+    const ur = results[0];
+    timetables = results[1]; meals = results[2]; exams = results[3]; events = results[4]; notices = results[5];
+    if(ur && ur.ok && ur.val){ users = ur.val; state.usersConfirmed = true; lsSet('allthing-users', true, users); }
+    else users = lsGet('allthing-users', true, null); // couldn't read the server: show what this device last saw, never write it back
   }catch(err){
     console.error('All thing: 초기 데이터를 불러오는 중 문제가 있었어요.', err);
-    // last resort if even the above somehow throws — read straight from the local mirror
-    // rather than let a network hiccup look like everything got wiped
     users = lsGet('allthing-users', true, null);
     timetables = lsGet('allthing-timetables', true, {});
     meals = lsGet('allthing-meals', true, []);
     exams = lsGet('allthing-exams', true, []);
     events = lsGet('allthing-events', true, []);
     notices = lsGet('allthing-notices', true, []);
-    session = lsGet('allthing-session', false, null);
   }
-
-  state.users = users || defaultUsers(); // display-only fallback — intentionally NOT saved anywhere
+  state.users = users || {};
   state.timetables = timetables || {};
   state.meals = meals || [];
   state.exams = exams || [];
   state.events = events || [];
   state.notices = notices || [];
   seedSeenNotices();
-
-  if(session && session.id && state.users[session.id]){
-    state.currentUser = session.id;
+  seedSeenExams();
+}
+async function init(){
+  const authUser = await authReady();
+  const session = lsGet('allthing-session', false, null);
+  if(authUser){
+    state.currentUser = authUser.uid;
+    if(!session) lsSet('allthing-session', false, { id: authUser.uid, ts: Date.now() });
+    await loadAllData();
+    if(!state.users[authUser.uid]){
+      // 서버에서 계정을 확인하지 못했거나, 계정이 지워졌어요 → 다시 로그인
+      state.currentUser = null;
+      if(state.usersConfirmed){ try{ await fbAuth.signOut(); }catch(e){} }
+    }
     state.view = 'home';
-    // launched via a home-screen-icon shortcut (long-press → 급식/시간표/수행평가·시험)
-    try{
-      const requested = new URLSearchParams(location.search).get('view');
-      const validShortcutViews = ['meals', 'timetable', 'exams'];
-      if(requested && validShortcutViews.includes(requested)){
-        state.view = requested;
-      }
-    }catch(e){}
+    applyShortcutView();
   }
   state.booted = true;
   render();
-  if(!state.currentUser) playSplash();
+  if(!state.currentUser){ playSplash(); return; }
   startRealtimeSync();
   setTimeout(() => { migrateInlinePhotos().catch(() => {}); }, 4000);
 }
-
 /* ---------- near-real-time sync ----------
    If a Firebase project is configured (see FIREBASE_CONFIG above), this attaches live
    listeners so every change is pushed to connected classmates instantly. Otherwise it
@@ -1690,32 +1714,39 @@ function applyRemoteUpdate(sKey, val){
     notifyNewNotices();
     if(state.view === 'notices') markNoticesRead(); // already looking at the tab — don't leave a stale badge
   }
+  if(sKey === 'exams') notifyNewExams();
   if(state.ttEditor.open || state.editing.section) return; // don't clobber an in-progress edit
   render();
 }
+let syncRefs = [];
 function startRealtimeSync(){
   if(firebaseReady && fbDb){
+    stopRealtimeSync();
     Object.keys(SYNC_KEY_MAP).forEach(key => {
-      fbDb.ref('allthing/'+key).on('value', snap => {
+      const ref = fbDb.ref('allthing/'+key);
+      syncRefs.push(ref);
+      ref.on('value', snap => {
         const val = snap.val();
+        if(!state.currentUser) return;
         if(key === 'allthing-users' || key === 'allthing-timetables'){
           if(val === null || val === undefined) return; // never let an empty read erase accounts/timetables
           state[key === 'allthing-users' ? 'usersConfirmed' : 'timetablesConfirmed'] = true;
           lsSet(key, true, val);
-          if(key === 'allthing-users') state.users = val; // keep login data current even on the login screen
-          if(!state.currentUser) return;
           applyRemoteUpdate(SYNC_KEY_MAP[key], val);
           return;
         }
-        if(!state.currentUser) return;
         const list = (val === null || val === undefined) ? [] : val; // a deleted-last-item list is genuinely empty
         lsSet(key, true, list);
         applyRemoteUpdate(SYNC_KEY_MAP[key], list);
-      });
+      }, err => { console.warn('All thing: 실시간 동기화가 끊겼어요 (' + key + ')', err && err.code); });
     });
     return;
   }
   startPolling();
+}
+function stopRealtimeSync(){
+  syncRefs.forEach(r => { try{ r.off(); }catch(e){} });
+  syncRefs = [];
 }
 let pollTimer = null;
 function startPolling(){
@@ -1737,69 +1768,71 @@ function startPolling(){
 }
 
 /* ---------- auth ---------- */
+let loginBusy = false;
 async function handleLoginSubmit(){
   const idEl = document.getElementById('loginId');
   const pwEl = document.getElementById('loginPw');
   const rememberEl = document.getElementById('loginRemember');
-  if(!idEl || !pwEl) return;
+  if(!idEl || !pwEl || loginBusy) return;
   const id = idEl.value.trim();
   const pw = pwEl.value.trim();
   const remember = rememberEl ? rememberEl.checked : true;
-  let user = state.users[id];
-  let ok = await verifyPassword(user, pw);
-  if(!ok && firebaseReady && fbDb){
-    // This device may be holding a stale/default copy of the accounts (e.g. it booted while
-    // the server was unreachable). Re-check against the server before saying "wrong password".
-    const r = await fbReadStrict('allthing-users', 6000);
-    if(r.ok && r.val){
-      state.users = r.val; state.usersConfirmed = true; lsSet('allthing-users', true, r.val);
-      user = state.users[id];
-      ok = await verifyPassword(user, pw);
-    } else if(!r.ok){
-      state.loginError = '서버와 연결이 확인되지 않아요. 인터넷 연결을 확인하고 다시 시도해주세요.';
-      render();
-      return;
-    }
-  }
-  if(!ok){
-    state.loginError = '아이디 또는 비밀번호가 올바르지 않아요.';
+  if(!id || !pw){ state.loginError = '아이디와 비밀번호를 입력해주세요.'; render(); return; }
+  if(!fbAuth){ state.loginError = '서버 연결을 준비하지 못했어요. 새로고침 후 다시 시도해주세요.'; render(); return; }
+  loginBusy = true;
+  state.loginIdDraft = id;
+  const btn = document.querySelector('#loginCard button[type="submit"]');
+  if(btn){ btn.disabled = true; btn.textContent = '로그인 중…'; }
+  try{
+    const r = await api('login', { id, pw });
+    // "로그인 유지"를 끄면 브라우저를 닫을 때 로그인이 풀려요
+    await fbAuth.setPersistence(remember ? firebase.auth.Auth.Persistence.LOCAL : firebase.auth.Auth.Persistence.SESSION);
+    await fbAuth.signInWithCustomToken(r.token);
+  }catch(e){
+    loginBusy = false;
+    state.loginError = e.message || '로그인하지 못했어요.';
     render();
     return;
   }
-  if(!user.pwHash && (!(firebaseReady && fbDb) || state.usersConfirmed)){
-    // quietly upgrade this account's plain-text password to a hash (only touches this one account)
-    passwordFieldChanges(id, pw, pw === id).then(ch => updateUsers(ch)).catch(() => {});
-  }
+  loginBusy = false;
   state.loginError = '';
+  await loadAllData(); // (currentUser is set only afterwards, so a render meanwhile can't think the account vanished)
+  if(!state.users[id]){
+    try{ await fbAuth.signOut(); }catch(e){}
+    state.loginError = '계정 정보를 불러오지 못했어요. 잠시 후 다시 시도해주세요.';
+    render();
+    return;
+  }
   state.currentUser = id;
   state.view = 'home';
-  // launched via a home-screen-icon shortcut but wasn't logged in yet — land on the
-  // requested tab once login succeeds instead of just going to home
-  try{
-    const requested = new URLSearchParams(location.search).get('view');
-    const validShortcutViews = ['meals', 'timetable', 'exams'];
-    if(requested && validShortcutViews.includes(requested)){
-      state.view = requested;
-    }
-  }catch(e){}
+  applyShortcutView(); // launched via a home-screen-icon shortcut but wasn't logged in yet
   state.brandAnimPlayed = false;
   state.navAnim = 'view-enter';
+  startRealtimeSync();
   setTimeout(() => { migrateInlinePhotos().catch(() => {}); }, 4000);
-  if(remember){
-    await sSet('allthing-session', { id, ts: Date.now() }, false);
-  } else {
-    await sDel('allthing-session', false);
-  }
+  if(remember) lsSet('allthing-session', false, { id, ts: Date.now() });
+  else await sDel('allthing-session', false);
   render();
 }
 async function handleLogout(){
   if(state.game) stopGameSync();
+  stopRealtimeSync();
   state.currentUser = null;
   state.view = 'home';
   state.splashPlayed = false;
   await sDel('allthing-session', false);
+  try{ if(fbAuth) await fbAuth.signOut(); }catch(e){}
   render();
   playSplash();
+}
+// 로그인이 만료됐거나 계정이 바뀌었을 때: 로그인 화면으로
+let reloginPending = false;
+async function forceRelogin(msg){
+  if(reloginPending || !state.currentUser) return;
+  reloginPending = true;
+  await handleLogout();
+  if(msg) showToast(msg, 'err');
+  reloginPending = false;
 }
 function goto(view, animClass){
   state.navAnim = animClass || 'view-enter';
@@ -1849,8 +1882,7 @@ async function changePassword(){
   const pw2 = document.getElementById('pfPw2').value;
   if(pw1.length < 6){ showToast('비밀번호는 6자 이상으로 입력해주세요.', 'err'); return; }
   if(pw1 !== pw2){ showToast('새 비밀번호가 서로 달라요.', 'err'); return; }
-  const myId = state.currentUser;
-  try{ await updateUsers(await passwordFieldChanges(myId, pw1, false)); }catch(e){ return; }
+  if(!(await apiToast('account', { action:'changePassword', pw: pw1 }))) return;
   showToast('비밀번호를 바꿨어요.');
   render();
 }
@@ -1876,7 +1908,7 @@ async function acctResetDefault(id){
   const u = state.users[id];
   if(!u) return;
   if(!confirm(`${u.displayName}(${id})의 비밀번호를 아이디와 같은 값으로 초기화할까요?`)) return;
-  try{ await updateUsers(await passwordFieldChanges(id, id, true)); }catch(e){ return; }
+  if(!(await apiToast('account', { action:'resetPassword', id }))) return;
   showToast('비밀번호를 초기화했어요.');
   state.acctEditing = null;
   render();
@@ -1900,27 +1932,14 @@ async function acctSave(id){
   }
 
   const renaming = newId !== id;
-  try{
-    if(!(await ensureConfirmed('allthing-users', 'usersConfirmed'))) return;
-    if(renaming && state.users[newId]){ showToast('이미 사용 중인 아이디예요.', 'err'); return; }
-    if(renaming){
-      const record = Object.assign({}, state.users[id], { displayName: newName, isAdmin: newIsAdmin });
-      if(newPw){ delete record.password; Object.assign(record, await passwordRecordFields(newPw, false)); }
-      await updateUsers({ [newId]: record, [id]: null }); // one atomic move, nobody else touched
-    } else {
-      const changes = { [id+'/displayName']: newName, [id+'/isAdmin']: newIsAdmin };
-      if(newPw) Object.assign(changes, await passwordFieldChanges(id, newPw, false));
-      await updateUsers(changes);
-    }
-  }catch(e){ return; }
   if(renaming){
-    await moveGamePlayer(id, newId);
-    if(state.game && state.game.syncedFor === id) stopGameSync();
-  }
-  if(renaming && state.currentUser === id){
-    state.currentUser = newId;
-    const session = await sGet('allthing-session', false, null);
-    if(session) await sSet('allthing-session', { id: newId, ts: Date.now() }, false);
+    if(state.users[newId]){ showToast('이미 사용 중인 아이디예요.', 'err'); return; }
+    const r = await apiToast('account', { action:'rename', id, newId, name: newName, isAdmin: newIsAdmin, pw: newPw });
+    if(!r) return;
+    if(r.self){ await forceRelogin('아이디가 바뀌었어요. 새 아이디로 다시 로그인해주세요.'); return; }
+  } else {
+    try{ await updateUsers({ [id+'/displayName']: newName, [id+'/isAdmin']: newIsAdmin }); }catch(e){ return; }
+    if(newPw && !(await apiToast('account', { action:'setPassword', id, pw: newPw }))) return;
   }
   showToast('계정 정보를 저장했어요.');
   state.acctEditing = null;
@@ -1965,40 +1984,21 @@ async function acctSubmitAdd(){
   if(!id){ showToast('아이디를 입력해주세요.', 'err'); return; }
   const name = nameEl.value.trim() || id;
   const no = noEl.value.trim() || id;
-  try{
-    if(!(await ensureConfirmed('allthing-users', 'usersConfirmed'))) return;
-    if(state.users[id]){ showToast('이미 사용 중인 아이디예요.', 'err'); return; }
-    const record = Object.assign({ displayName: name, studentNo: no, isAdmin: false }, await passwordRecordFields(id, true));
-    await updateUsers({ [id]: record });
-  }catch(e){ return; }
-  showToast('계정을 추가했어요.');
+  if(state.users[id]){ showToast('이미 사용 중인 아이디예요.', 'err'); return; }
+  const r = await apiToast('account', { action:'create', id, name, no });
+  if(!r) return;
+  state.users = Object.assign({}, state.users, { [id]: r.record });
+  showToast('계정을 추가했어요. 처음 비밀번호는 아이디와 같아요.');
   state.acctAdding = false;
   render();
-}
-function gamePlayerRef(id){ return gameDb().ref('allthing/allthing-game/players/' + id); }
-async function deleteAccountData(id, studentNo){
-  // the account itself is already gone at this point; this removes what hung off it
-  try{ await withTimeout(gamePlayerRef(id).set(null), 8000, null); }catch(e){}
-  // a timetable is keyed by 학번 — only drop it if no remaining account still uses that 학번
-  if(studentNo && state.timetables[studentNo] && !Object.keys(state.users).some(k => (state.users[k] || {}).studentNo === studentNo)){
-    try{ await updateTimetables({ [studentNo]: null }); }catch(e){}
-  }
-}
-async function moveGamePlayer(oldId, newId){
-  const val = await withTimeout(gamePlayerRef(oldId).once('value').then(s => s.val()), 8000, undefined);
-  if(!val) return;
-  const existing = await withTimeout(gamePlayerRef(newId).once('value').then(s => s.val()), 8000, undefined);
-  if(existing === undefined) return; // couldn't confirm the target is free — leave everything as is
-  if(!existing) await withTimeout(gamePlayerRef(newId).set(val), 8000, null);
-  await withTimeout(gamePlayerRef(oldId).set(null), 8000, null);
 }
 async function acctDelete(id){
   const u = state.users[id];
   if(!u) return;
   if(id === state.currentUser){ showToast('현재 로그인한 계정은 삭제할 수 없어요.', 'err'); return; }
   if(!confirm(`${u.displayName}(${id}) 계정을 정말 삭제할까요? 주식게임 기록과 시간표도 함께 지워지고, 되돌릴 수 없어요.`)) return;
-  try{ await updateUsers({ [id]: null }); }catch(e){ return; }
-  await deleteAccountData(id, u.studentNo);
+  if(!(await apiToast('account', { action:'delete', id }))) return;
+  const next = Object.assign({}, state.users); delete next[id]; state.users = next;
   showToast('계정과 관련 데이터를 삭제했어요.');
   render();
 }
@@ -2036,53 +2036,32 @@ function renderGameAdminCard(){
     </div>
   </div>`;
 }
-async function setGameControl(mutate, okMsg){
-  const before = gameCtrl();
-  const res = await withTimeout(gameRef('control').transaction(cur => { const c = Object.assign({}, GAME_CTRL_DEFAULT, cur || {}); mutate(c); return c; }), 8000, null);
-  if(!res || !res.committed){ showToast('변경하지 못했어요. 잠시 후 다시 시도해주세요.', 'err'); return; }
-  const after = Object.assign({}, GAME_CTRL_DEFAULT, res.snapshot.val() || {});
-  state.game.control = after;
-  // coming back from a full shutdown: skip the paused time instead of replaying it as price moves
-  if(!marketRunning(before) && marketRunning(after)) await fastForwardMarket();
+// 운영자 기능도 서버에서 처리해요 (게임 데이터는 서버만 쓸 수 있어요)
+async function setGameControl(op, okMsg, id){
+  const r = await apiToast('game', { action:'control', op, id });
+  if(!r) return;
+  if(state.game) state.game.control = r.control;
   showToast(okMsg);
   render();
-}
-async function fastForwardMarket(){
-  await withTimeout(gameRef('market').transaction(cur => {
-    if(!cur || !cur.prices) return undefined;
-    const now = gameTickNow();
-    if(cur.tick >= now) return undefined;
-    const pad = Math.min(now - cur.tick, GAME_HISTORY_LEN), history = {};
-    GAME_STOCKS.forEach(s => {
-      const h = ((cur.history || {})[s.id] || [cur.prices[s.id]]).slice();
-      for(let i = 0; i < pad; i++){ h.push(cur.prices[s.id]); if(h.length > GAME_HISTORY_LEN) h.shift(); }
-      history[s.id] = h;
-    });
-    return Object.assign({}, cur, { tick: now, history, prev: cur.prices, trend: {}, flow: {} });
-  }), 8000, null);
 }
 function gameToggleOpen(){
   const c = gameCtrl();
   if(c.open){
     if(!confirm('주식게임을 셧다운할까요? 시세와 뉴스가 모두 멈추고, 친구들은 게임 탭에서 "게임이 잠겼습니다"를 보게 돼요.')) return;
-    setGameControl(x => { x.open = false; }, '게임을 셧다운했어요.');
+    setGameControl('shutdown', '게임을 셧다운했어요.');
   } else {
     if(!confirm('주식게임을 모두에게 다시 열까요?')) return;
-    setGameControl(x => { x.open = true; x.test = false; }, '게임을 다시 열었어요.');
+    setGameControl('open', '게임을 다시 열었어요.');
   }
 }
 function gameToggleTest(){
   const c = gameCtrl();
   if(c.open) return;
-  setGameControl(x => { x.test = !c.test; }, c.test ? '테스트를 껐어요.' : '테스트를 켰어요. 운영자와 테스터만 들어갈 수 있어요.');
+  setGameControl('test', c.test ? '테스트를 껐어요.' : '테스트를 켰어요. 운영자와 테스터만 들어갈 수 있어요.');
 }
 function gameToggleTester(id){
-  setGameControl(x => { x.testers = Object.assign({}, x.testers || {}); if(x.testers[id]) delete x.testers[id]; else x.testers[id] = true; },
-    (gameCtrl().testers || {})[id] ? '테스터에서 뺐어요.' : '테스터로 지정했어요.');
+  setGameControl('tester', (gameCtrl().testers || {})[id] ? '테스터에서 뺐어요.' : '테스터로 지정했어요.', id);
 }
-// The reset password itself is NOT in this code — only a one-way PBKDF2 hash of it (same settings
-// as account passwords), so reading the source doesn't reveal it.
-const GAME_RESET_KEY = { salt:'allthing-game-reset-7f3a91c2', hash:'9395d43da3e9079583b03489fee56475f9711a7a4cb752e4044824fe9996d31c' };
 function openResetPrompt(){
   if(!confirm('정말 주식게임을 초기화하겠습니까?\n모든 친구의 돈·주식·아이템, 그리고 시세·뉴스가 처음 상태로 돌아가요.')) return;
   state.resetPrompt = true; render();
@@ -2093,36 +2072,25 @@ async function submitResetPrompt(){
   const el = document.getElementById('resetPw');
   const pw = el ? el.value : '';
   if(!pw){ showToast('비밀번호를 입력해주세요.', 'err'); return; }
-  let ok = false;
-  try{ ok = (await hashPassword(pw, GAME_RESET_KEY.salt)) === GAME_RESET_KEY.hash; }catch(e){}
   if(el) el.value = '';
-  if(!ok){ await new Promise(r => setTimeout(r, 1200)); showToast('비밀번호가 맞지 않아요.', 'err'); return; } // small delay slows down guessing
-  state.resetPrompt = false;
-  render();
-  await gameReset(true);
-}
-async function gameReset(passwordChecked){
-  if(!passwordChecked) return; // only reachable through the password prompt
   if(!confirm('마지막 확인이에요. 지금 초기화하면 되돌릴 수 없어요. 진행할까요?')) return;
-  const n = parseInt(String(gameCtrl().season || 's1').replace(/\D/g, ''), 10) || 1;
-  await withTimeout(gameRef('players').set(null), 8000, null);
-  await withTimeout(gameRef('market').set(null), 8000, null);
-  await withTimeout(gameRef('flow').set(null), 8000, null);
-  await setGameControl(x => { x.season = 's' + (n + 1); }, '새 시즌(' + (n + 1) + ')으로 초기화했어요.');
+  const r = await apiToast('game', { action:'reset', password: pw }); // 비밀번호는 서버에서 확인해요
+  if(!r) return;
+  state.resetPrompt = false;
   if(state.game){ state.game.ranking = null; state.game.log = null; }
+  showToast('새 시즌(' + r.season + ')으로 초기화했어요.');
+  render();
 }
 async function cleanupOrphanGameData(){
-  try{ if(!(await ensureConfirmed('allthing-users', 'usersConfirmed'))) return; }catch(e){ return; }
-  const ids = Object.keys(state.users || {});
-  if(!ids.length){ showToast('계정 목록을 확인할 수 없어 정리하지 않았어요.', 'err'); return; }
-  const players = await withTimeout(gameDb().ref('allthing/allthing-game/players').once('value').then(s => s.val()), 8000, undefined);
-  if(players === undefined){ showToast('주식게임 데이터를 불러오지 못했어요. 잠시 후 다시 시도해주세요.', 'err'); return; }
-  const orphans = Object.keys(players || {}).filter(id => !state.users[id]);
+  const r = await apiToast('game', { action:'orphans' });
+  if(!r) return;
+  const orphans = r.orphans || [];
   if(!orphans.length){ showToast('정리할 데이터가 없어요. 이미 깨끗해요.'); return; }
   if(!confirm('지금은 없는 계정의 주식게임 기록 ' + orphans.length + '개를 지울까요?\n(' + orphans.join(', ') + ')')) return;
-  for(const id of orphans){ try{ await withTimeout(gamePlayerRef(id).set(null), 8000, null); }catch(e){} }
+  const r2 = await apiToast('game', { action:'cleanup', ids: orphans });
+  if(!r2) return;
   if(state.game) state.game.ranking = null;
-  showToast(orphans.length + '개 계정의 남은 기록을 정리했어요.');
+  showToast(r2.removed + '개 계정의 남은 기록을 정리했어요.');
 }
 
 /* ---------- generic section CRUD (meals / exams / events / notices) ---------- */
@@ -2471,6 +2439,7 @@ async function submitSectionForm(section){
     if(fieldName === 'photos') await savePhotosForItem(saved.id, pendingExternal[fieldName]);
   }
   if(section === 'notices'){ seedSeenNotices(); markNoticesRead(); } // this device already knows about the notice it just posted
+  if(section === 'exams') seedSeenExams(); // …and about the exam it just added
   state.editing = { section:null, id:null, data:null };
   showToast(id ? '수정했어요.' : '추가했어요.');
   render();
@@ -2966,7 +2935,7 @@ function renderHome(){
   const u = me();
   const now = new Date();
   const dateLabel = `${now.getFullYear()}년 ${now.getMonth()+1}월 ${now.getDate()}일 (${WEEKDAY_KO[now.getDay()]})`;
-  const showDefaultPwHint = u.pwHash ? !!u.pwDefault : (u.password === state.currentUser);
+  const showDefaultPwHint = !!u.pwDefault;
   return `
   <div class="home-greeting">
     <h2>안녕, ${esc(u.displayName)}님 👋</h2>
@@ -3065,10 +3034,10 @@ function renderNotificationCard(){
     <h3>${icon('notice')} 알림</h3>
     <div class="toggle-row">
       <div>
-        <div class="toggle-row-title">새 공지 알림</div>
-        <div class="text-2">공지가 새로 올라오면 이 기기로 알려드려요</div>
+        <div class="toggle-row-title">새 공지·수행평가 알림</div>
+        <div class="text-2">공지나 수행평가·시험이 새로 올라오면 이 기기로 알려드려요. 수행평가·시험 알림에는 과목명이 함께 나와요.</div>
       </div>
-      <button type="button" class="switch ${enabled?'on':''}" data-act="toggleNotif" role="switch" aria-checked="${enabled}" aria-label="새 공지 알림">
+      <button type="button" class="switch ${enabled?'on':''}" data-act="toggleNotif" role="switch" aria-checked="${enabled}" aria-label="새 공지·수행평가 알림">
         <span class="switch-knob"></span>
       </button>
     </div>
@@ -3254,7 +3223,7 @@ function renderLogin(){
       <p class="hero-sub">급식, 시간표, 수행평가부터 일정까지 — 한 눈에</p>
     </div>
     <form class="login-card ${already?'show':'pending'}" id="loginCard" data-form="login">
-      <label class="field"><span>아이디</span><input id="loginId" type="text" autocomplete="username" placeholder="예: 20801" required></label>
+      <label class="field"><span>아이디</span><input id="loginId" type="text" autocomplete="username" placeholder="예: 20801" value="${esc(state.loginIdDraft || '')}" required></label>
       <label class="field"><span>비밀번호</span>
         <div class="pw-field">
           <input id="loginPw" type="password" autocomplete="current-password" placeholder="비밀번호" required>
@@ -3302,8 +3271,12 @@ function playSplash(){
 
       // 4. 1.85초 후 (폭죽이 잠시 보인 다음) 제목이 로그인 화면 상단 자리로 축소 이동 + 로그인 카드 등장
       setTimeout(() => {
-        heroEl.classList.add('compact');
-        if(card){ card.classList.remove('pending'); card.classList.add('show'); }
+        // re-find the elements: a toast (e.g. "다시 로그인해주세요") may have re-rendered the screen meanwhile
+        const h = document.getElementById('hero') || heroEl, c = document.getElementById('loginCard') || card;
+        const w = document.getElementById('morphWord');
+        h.classList.add('compact');
+        if(w && !w.classList.contains('morphed')){ w.textContent = 'All thing'; w.classList.add('morphed'); }
+        if(c){ c.classList.remove('pending'); c.classList.add('show'); }
         state.splashPlayed = true;
       }, 1850);
     });
@@ -3485,8 +3458,10 @@ function render(){
   // an account deleted (by an admin, on another device) while still logged in here
   if(state.currentUser && !state.users[state.currentUser]){
     if(state.game && state.game.syncedFor) stopGameSync();
+    stopRealtimeSync();
     state.currentUser = null;
     try{ localStorage.removeItem(lsKey('allthing-session', false)); }catch(e){}
+    try{ if(fbAuth) fbAuth.signOut(); }catch(e){}
     state.toast = { msg:'이 계정이 삭제되어 로그아웃됐어요.', type:'err' };
   }
   const keep = snapshotScroll();
@@ -3774,28 +3749,22 @@ function renderInstallBanner(){
 })();
 
 /* ===================== 주식 게임 =====================
-   Serverless design:
-   - Prices advance every 30 minutes. Whichever device first notices a new 30-minute slot
-     advances the market inside a Firebase transaction, so it happens exactly once even if
-     several people open the app at the same moment. Missed slots (e.g. overnight) are
-     caught up in one go, capped to the history length.
-   - Each player's wallet lives at its own path and is only ever changed through a
-     transaction on that path, so double-taps or two open tabs can't double-spend.
-   - The daily allowance is claimed lazily on the first visit of each day (no server cron).
-   - Nothing here is synced until someone actually opens the game tab, and the market node
-     stays tiny (a few numbers per stock), so this adds very little Firebase traffic.
-*/
+   보안 구조 (2026-11 개편):
+   - 시세 진행, 매수·매도, 로또 추첨, 아이템, 지원금, 자동 손절·익절은 전부 서버(/api/game)가 해요.
+     데이터베이스 규칙상 이 기기는 게임 데이터를 읽기만 할 수 있어서, 페이지를 고쳐도 돈이 안 바뀌어요.
+   - 뉴스의 정답(호재/악재, 영향 %, 관련 종목)은 서버에만 있어요. 이 기기에는 기사 내용만 와요.
+     뉴스 요약권을 쓰면 서버가 요약을 내 지갑에 넣어줘요.
+   - 끝난 연재·단독 기사는 24시간이 지나거나 그 뒤로 새 기사가 6개 나오면 서버가 자동으로 지워요. */
 const GAME_PATH = 'allthing/allthing-game';
 const GAME_TICK_MS = 30 * 60 * 1000;
 const GAME_START_CASH = 1000000;
 const GAME_DAILY_CASH = 100000;
-const GAME_HISTORY_LEN = 48; // one day of 30-minute steps
 const GAME_STOCKS = [
-  { id:'meal',    name:'급식컴퍼니',     type:'안정형', sector:'식품',   vol:0.012, base:10000 },
-  { id:'library', name:'도서관미디어',   type:'안정형', sector:'미디어', vol:0.016, base:15000 },
-  { id:'store',   name:'매점전자',       type:'성장형', sector:'전자',   vol:0.026, base:20000 },
-  { id:'gym',     name:'체육관건설',     type:'고위험', sector:'건설',   vol:0.048, base:8000 },
-  { id:'break',   name:'쉬는시간게임즈', type:'테마형', sector:'게임',   vol:0.032, base:5000, jump:true }
+  { id:'meal',    name:'급식컴퍼니',     type:'안정형', sector:'식품' },
+  { id:'library', name:'도서관미디어',   type:'안정형', sector:'미디어' },
+  { id:'store',   name:'매점전자',       type:'성장형', sector:'전자' },
+  { id:'gym',     name:'체육관건설',     type:'고위험', sector:'건설' },
+  { id:'break',   name:'쉬는시간게임즈', type:'테마형', sector:'게임' }
 ];
 const GAME_ITEMS = [
   { id:'autoOrder', name:'자동 손절·익절 예약권', price:30000, dailyLimit:3,
@@ -3805,7 +3774,7 @@ const GAME_ITEMS = [
   { id:'lotto', name:'로또', price:30000, dailyLimit:3, instant:true,
     desc:'사자마자 바로 긁어서 결과가 나와요. 운이 좋으면 최대 100만원!' }
 ];
-// average payout ≈ 27,100원 per 30,000원 ticket (90%) — fun, but not a money printer
+// 당첨 확률표 (보여주기용 — 실제 추첨은 서버에서 해요)
 const LOTTO_PRIZES = [
   { tier:'jackpot', label:'🎉 대박!!',    amount:1000000, p:0.005 },
   { tier:'big',     label:'💰 거액 당첨', amount:300000,  p:0.035 },
@@ -3813,112 +3782,12 @@ const LOTTO_PRIZES = [
   { tier:'small',   label:'🙂 소액 당첨', amount:20000,   p:0.25 },
   { tier:'lose',    label:'😢 꽝',        amount:0,       p:0.60 }
 ];
-function drawLotto(){
-  let r = Math.random();
-  for(const pz of LOTTO_PRIZES){ if(r < pz.p) return pz; r -= pz.p; }
-  return LOTTO_PRIZES[LOTTO_PRIZES.length - 1];
-}
-// retired items — kept only so old log lines still read nicely and leftovers can be refunded
+// retired items — kept only so old log lines still read nicely
 const LEGACY_ITEMS = { hintUp:{ name:'상승 힌트', price:50000 }, hintDown:{ name:'하락 경고', price:50000 } };
-// 50-minute periods (each starts at :40, ends at :30; lunch 12:30–13:40); trading is locked during these
+// 50-minute periods (each starts at :40, ends at :30; lunch 12:30–13:40); buying is locked during these
 const CLASS_PERIODS = [['08:40','09:30'],['09:40','10:30'],['10:40','11:30'],['11:40','12:30'],['13:40','14:30'],['14:40','15:30'],['15:40','16:30']];
 // how many periods each weekday has (Mon/Tue/Thu end 16:30, Wed 15:30, Fri 14:30)
 const PERIODS_BY_WEEKDAY = { 1:7, 2:7, 3:6, 4:7, 5:5 };
-
-/* ---- news events ----
-   At the start of lunch (12:30) and at the end of each school day, there's only a chance of a
-   news story. A story moves the affected stocks immediately AND leaves a fading trend in the
-   same direction for the next ~2 hours, so reading the news quickly is actually worth something. */
-let GAME_NEWS_PROB = 0.3;        // chance of a story at each news slot (≈2–3 a school day)
-const GAME_NEWS_KEEP = 20;       // stories kept in the feed
-const GAME_TREND_TICKS = 4;      // (legacy constant, kept for older data/tests)
-/* ---- stories ----
-   Articles are written like school news — they never say which stock moves or by how much.
-   Readers have to work it out (or buy a 뉴스 요약). Each stock has a 3-part serial: part 1 is a
-   rumour, part 2 branches into a good or bad turn, part 3 wraps up. Some stories move several
-   stocks in different directions at once (fx), e.g. exam season.
-   dir/str: hidden direction and strength. next: possible following parts (one is picked at random). */
-const STORY_NODES = {
-  // 급식컴퍼니
-  m1:  { arc:'meal', part:1, stock:'meal', dir: 1, str:0.5, emoji:'🚚', title:'급식실에 낯선 트럭이…', next:['m2a','m2b'],
-         body:'오늘 아침 급식실 뒷문으로 처음 보는 납품 트럭이 들어가는 모습이 목격됐다. 영양사 선생님은 "아직은 말씀드릴 수 없다"며 웃기만 했다.' },
-  m2a: { arc:'meal', part:2, stock:'meal', dir: 1, str:1.2, emoji:'🍗', title:'"오늘 메뉴 실화냐"… 급식 줄 역대 최장', next:['m3a'],
-         body:'새 납품업체와 손잡은 첫날, 점심 종이 울리자마자 급식실 앞 줄이 복도 끝까지 이어졌다. 매점은 이날 유난히 한산했다는 후문.' },
-  m2b: { arc:'meal', part:2, stock:'meal', dir:-1, str:1.0, emoji:'🧾', title:'새 업체 단가 논란… "반찬이 하나 줄었다"', next:['m3b'],
-         body:'납품 단가를 둘러싼 잡음이 이어지는 가운데, 오늘 식판을 받아 든 학생들 사이에서 "뭔가 허전하다"는 반응이 나왔다. 일부는 매점으로 발길을 돌렸다.' },
-  m3a: { arc:'meal', part:3, stock:'meal', dir: 1, str:0.9, emoji:'🏆', title:'교육청 관계자, 급식실 깜짝 방문', next:[],
-         body:'점심시간에 교육청 관계자들이 급식실을 둘러보고 사진을 여러 장 찍어 갔다. "다른 학교에도 소개하고 싶다"는 말이 들렸다고 한다.' },
-  m3b: { arc:'meal', part:3, stock:'meal', dir:-1, str:0.7, emoji:'✍️', title:'학생회, 급식 관련 서명운동 시작', next:[],
-         body:'학생회가 급식 관련 서명을 받기 시작했다. 첫날에만 수백 명이 이름을 올렸다. 학교 측은 "의견을 듣고 있다"고만 밝혔다.' },
-  // 매점전자
-  s1:  { arc:'store', part:1, stock:'store', dir: 1, str:0.5, emoji:'📦', title:'매점 창고에 쌓인 "비밀 박스"', next:['s2a','s2b'],
-         body:'매점 창고에 테이프로 꽁꽁 감긴 상자들이 하루가 다르게 늘고 있다. 매점 사장님은 "곧 알게 될 거야"라는 말만 남겼다.' },
-  s2a: { arc:'store', part:2, stock:'store', dir: 1, str:1.3, emoji:'📱', title:'베일 벗은 상자의 정체… 쉬는 시간마다 줄', next:['s3a'],
-         body:'상자의 정체는 새로 나온 기기였다. 쉬는 시간 종이 칠 때마다 매점 앞에 줄이 생기고, 몇몇 반에서는 점심 대신 매점을 택했다는 이야기도 나온다.' },
-  s2b: { arc:'store', part:2, stock:'store', dir:-1, str:1.0, emoji:'⏳', title:'진열대에 붙은 "입고 지연" 안내문', next:['s3b'],
-         body:'오늘 아침 매점 진열대에 "입고가 늦어지고 있습니다"라는 안내문이 붙었다. 기다리던 학생들 사이에서 실망 섞인 한숨이 나왔다.' },
-  s3a: { arc:'store', part:3, stock:'store', dir: 1, str:0.8, emoji:'🔋', title:'충전기까지 동났다… "다음 입고 언제예요?"', next:[],
-         body:'기기에 이어 충전기와 케이스까지 바닥났다. 쉬는 시간마다 기기로 게임을 하는 학생들도 부쩍 늘었다.' },
-  s3b: { arc:'store', part:3, stock:'store', dir:-1, str:0.9, emoji:'🔧', title:'"전원이 안 켜져요"… 매점에 문의 잇따라', next:[],
-         body:'뒤늦게 들어온 물건을 산 학생 몇 명이 고장을 호소하고 있다. 매점 측은 "확인 중"이라는 입장이다.' },
-  // 도서관미디어
-  l1:  { arc:'library', part:1, stock:'library', dir: 1, str:0.5, emoji:'📖', title:'도서관에 걸린 의미심장한 포스터', next:['l2a','l2b'],
-         body:'도서관 입구에 실루엣만 그려진 포스터가 붙었다. 날짜도 이름도 없다. 사서 선생님은 "유명한 분이 오실지도…"라며 말끝을 흐렸다.' },
-  l2a: { arc:'library', part:2, stock:'library', dir: 1, str:1.2, emoji:'✍️', title:'사인회 신청 3분 만에 마감', next:['l3a'],
-         body:'포스터의 주인공은 요즘 가장 인기 있는 작가였다. 사인회 신청은 3분 만에 끝났고, 그 작가의 책은 대출 대기만 수십 명이다. 쉬는 시간 게임 대신 책을 펴는 학생이 늘었다.' },
-  l2b: { arc:'library', part:2, stock:'library', dir:-1, str:1.0, emoji:'🚫', title:'"부득이한 사정으로…" 행사 취소 공지', next:['l3b'],
-         body:'기대를 모았던 도서관 행사가 갑자기 취소됐다. 공지문 앞에서 발길을 돌린 학생들은 휴대폰을 꺼내 들었다.' },
-  l3a: { arc:'library', part:3, stock:'library', dir: 1, str:0.9, emoji:'🎬', title:'"그 소설, 영화로 나온대"', next:[],
-         body:'사인회 이후 작가의 소설이 영화로 만들어진다는 이야기가 돌고 있다. 도서관 열람실은 오늘도 빈자리가 없다.' },
-  l3b: { arc:'library', part:3, stock:'library', dir:-1, str:0.7, emoji:'💤', title:'텅 빈 열람실, 시끌벅적한 복도', next:[],
-         body:'행사 취소 이후 열람실은 눈에 띄게 한산해졌다. 반대로 복도에서는 게임 이야기가 끊이지 않는다.' },
-  // 체육관건설
-  g1:  { arc:'gym', part:1, stock:'gym', dir: 1, str:0.5, emoji:'📐', title:'운동장에 나타난 측량 장비', next:['g2a','g2b'],
-         body:'오늘 운동장 한쪽에 측량 장비와 작업복 차림의 어른들이 보였다. 체육 선생님은 "좋은 소식이 있을 수도"라며 윙크했다.' },
-  g2a: { arc:'gym', part:2, stock:'gym', dir: 1, str:1.3, emoji:'🏗️', title:'새 체육관 착공식 날짜 확정', next:['g3a'],
-         body:'운동장 한편에 새 체육관이 들어선다는 소식이 공식 발표됐다. 운동부는 물론 점심시간 축구팀까지 들떴다. 급식을 서둘러 먹고 운동장으로 뛰어나가는 학생이 늘었다.' },
-  g2b: { arc:'gym', part:2, stock:'gym', dir:-1, str:1.2, emoji:'🌧️', title:'"예산 심의 보류"… 공사 계획 표류', next:['g3b'],
-         body:'기대를 모았던 공사 계획이 예산 문제로 미뤄졌다. 측량 장비는 운동장에서 자취를 감췄다.' },
-  g3a: { arc:'gym', part:3, stock:'gym', dir: 1, str:1.0, emoji:'🏟️', title:'지역 체육대회 유치전에 뛰어들어', next:[],
-         body:'새 체육관을 앞세워 지역 체육대회를 유치하자는 이야기가 오가고 있다. 학생회도 적극 돕겠다고 나섰다.' },
-  g3b: { arc:'gym', part:3, stock:'gym', dir:-1, str:0.8, emoji:'⚠️', title:'자재 창고에서 빗물이 샌다', next:[],
-         body:'미뤄진 공사에 쓰일 자재를 보관하던 창고에 빗물이 샌 것으로 확인됐다. 일부 자재는 다시 사야 할 수도 있다.' },
-  // 쉬는시간게임즈
-  b1:  { arc:'break', part:1, stock:'break', dir: 1, str:0.5, emoji:'🎮', title:'쉬는 시간마다 들리는 의문의 효과음', next:['b2a','b2b'],
-         body:'요즘 쉬는 시간이면 어느 반에서든 똑같은 효과음이 들린다. 물어봐도 다들 "아직 비밀"이라며 화면을 가린다.' },
-  b2a: { arc:'break', part:2, stock:'break', dir: 1, str:1.4, emoji:'🕹️', title:'신작 "교실 탈출", 반 전체 열풍', next:['b3a'],
-         body:'효과음의 정체는 새 게임이었다. 반마다 랭킹 경쟁이 붙었고, 도서관 열람실은 평소보다 조용하다는 소식이다.' },
-  b2b: { arc:'break', part:2, stock:'break', dir:-1, str:1.2, emoji:'📵', title:'생활지도부 "특별 점검" 예고', next:['b3b'],
-         body:'생활지도부가 다음 주부터 휴대폰 사용을 특별히 살펴보겠다고 예고했다. 쉬는 시간 풍경이 달라질지 관심이 쏠린다.' },
-  b3a: { arc:'break', part:3, stock:'break', dir: 1, str:1.0, emoji:'🏆', title:'학교 대항 게임 대회 개최 소식', next:[],
-         body:'인기에 힘입어 학교 대항 대회가 열린다는 소식이다. 기기를 새로 장만하려는 학생도 늘고 있다.' },
-  b3b: { arc:'break', part:3, stock:'break', dir:-1, str:0.9, emoji:'🐛', title:'점검 연장… "접속이 안 돼요"', next:[],
-         body:'게임 서버 점검이 예정보다 길어지고 있다. 할 일이 없어진 학생들이 도서관과 운동장으로 흩어졌다.' },
-  // 여러 종목이 엇갈리는 이야기: 시험 기간
-  w1:  { arc:'exam', part:1, fx:{ library: 0.9, break:-0.9, store:-0.3 }, str:1, emoji:'📝', title:'시험 D-7, 교실이 조용해졌다', next:['w2a','w2b'],
-         body:'시험이 일주일 앞으로 다가오자 교실 분위기가 확 바뀌었다. 쉬는 시간에도 문제집을 펴는 학생이 많아졌다.' },
-  w2a: { arc:'exam', part:2, fx:{ break: 1.0, store: 0.8, meal: 0.5, library:-0.5 }, str:1, emoji:'🎉', title:'"시험 끝!" 축제 일정 발표', next:[],
-         body:'시험이 끝나자마자 학교 축제 일정이 발표됐다. 학생들은 무엇을 하고 놀지, 무엇을 사고 먹을지 이야기하느라 바쁘다.' },
-  w2b: { arc:'exam', part:2, fx:{ library: 0.8, break:-1.0, gym:-0.5 }, str:1, emoji:'😵', title:'시험 범위가 늘었다고?', next:[],
-         body:'시험 범위가 예상보다 넓어졌다는 소식이 전해졌다. 점심시간 축구도, 쉬는 시간 게임도 당분간 쉬겠다는 학생이 늘었다.' },
-  // 단독 소식 (연재 아님)
-  x1:  { stock:'meal', dir: 1, str:0.8, emoji:'🌾', title:'올해 쌀 농사, 들려오는 소식은?', next:[],
-         body:'뉴스에서 올해 쌀 작황 이야기가 나왔다. "요 몇 년 중 최고"라는 평가가 많다.' },
-  x2:  { stock:'store', dir:-1, str:1.0, emoji:'🔥', title:'전자부품 공장 화재 소식', next:[],
-         body:'해외 전자부품 공장에서 큰불이 났다는 뉴스가 나왔다. 당분간 물건 구하기가 어려울 수 있다는 말도 나온다.' },
-  x3:  { stock:'library', dir:-1, str:0.8, emoji:'📰', title:'종이값 이야기가 또 나왔다', next:[],
-         body:'종이와 인쇄 비용이 계속 오른다는 기사가 나왔다. 출판사들이 신간 계획을 다시 살펴보고 있다고 한다.' },
-  x4:  { stock:'gym', dir: 1, str:0.8, emoji:'🏃', title:'"체육 시간 늘려주세요" 건의 쏟아져', next:[],
-         body:'학생회 건의함에 체육 시간과 시설에 대한 의견이 쏟아졌다. 학교도 긍정적으로 검토하겠다는 입장이다.' },
-  x5:  { stock:'break', dir:-1, str:0.9, emoji:'💬', title:'게임 커뮤니티가 밤새 시끄러웠다', next:[],
-         body:'어젯밤 한 게임 커뮤니티에서 운영 방식에 대한 불만 글이 수백 개 올라왔다. 회사는 아직 답이 없다.' },
-  x6:  { fx:{ meal:1, library:1, store:1, gym:1, break:1 }, str:0.7, emoji:'💰', title:'학교 예산이 늘어난다', next:[],
-         body:'내년 학교 예산이 크게 늘어난다는 소식이 전해졌다. 여기저기서 "이번엔 뭐가 바뀔까" 하는 기대가 나온다.' },
-  x7:  { fx:{ meal:-1, library:-1, store:-1, gym:-1, break:-1 }, str:0.7, emoji:'🌀', title:'태풍 북상… "다음 주 휴업할 수도"', next:[],
-         body:'큰 태풍이 올라오면서 다음 주 휴업 가능성까지 거론되고 있다. 학교 전체가 뒤숭숭하다.' }
-};
-const STORY_STARTS = ['m1','s1','l1','g1','b1','w1'];
-const STORY_SINGLES = ['x1','x2','x3','x4','x5','x6','x7'];
 const ARC_NAMES = { meal:'급식실의 낯선 트럭', store:'매점의 비밀 박스', library:'도서관의 수상한 포스터', gym:'운동장 측량 장비', break:'의문의 효과음', exam:'시험 기간' };
 // 공휴일·대체공휴일 (2026년 남은 날 + 2027년, 정부 월력요항 기준). School-specific days off
 // (재량휴업일, 개교기념일, 방학 …) are added by ticking "휴일" on an event in the 일정 tab.
@@ -3943,76 +3812,7 @@ function holidayInfo(d){
 const NIGHT_START = 23*60, NIGHT_END = 7*60;
 function isNightMinute(mins){ return mins >= NIGHT_START || mins < NIGHT_END; }
 function isFrozenTick(tickNo){ const d = new Date(tickNo * GAME_TICK_MS); return isNightMinute(d.getHours()*60 + d.getMinutes()); }
-function newsSlotTimes(d){
-  // school days: morning, the start of every break (each period ends at :30), and evening.
-  // days off: a relaxed spread through the day.
-  if(holidayInfo(d)) return ['09:00','12:30','16:30','19:00','21:00'].map(hmToMin);
-  const count = PERIODS_BY_WEEKDAY[d.getDay()] || 0;
-  const breaks = CLASS_PERIODS.slice(0, count).map(p => hmToMin(p[1]));
-  return [hmToMin('07:30')].concat(breaks, [hmToMin('19:00'), hmToMin('21:00')]);
-}
-function isNewsSlot(tickNo){
-  const d = new Date(tickNo * GAME_TICK_MS);
-  return newsSlotTimes(d).indexOf(d.getHours()*60 + d.getMinutes()) !== -1;
-}
-// How sectors pull on each other: negative = rivals (move opposite), positive = partners (move together)
-const STOCK_LINKS = {
-  meal:    { store:-0.6, gym: 0.4 },              // 급식 vs 매점: 같은 점심값을 두고 경쟁 / 체육활동 늘면 급식 수요↑
-  store:   { meal:-0.6, break: 0.5 },             // 전자기기가 잘 팔리면 게임도 잘 됨
-  library: { break:-0.6 },                        // 공부 vs 게임: 관심을 두고 경쟁
-  break:   { library:-0.6, store: 0.5, gym:-0.3 },
-  gym:     { meal: 0.4, break:-0.3 }              // 밖에서 운동 vs 실내 게임
-};
-// how hard each personality reacts to news
-const TYPE_IMPACT = { '안정형':0.6, '성장형':1.0, '고위험':1.6, '테마형':1.3 };
 function stockInfo(id){ return GAME_STOCKS.find(s => s.id === id); }
-const ARC_MIN_GAP = 2;        // a sequel waits at least 1 hour after the previous part
-const ARC_EXPIRE = 144;      // an unfinished serial is dropped after ~3 days
-function pickStory(tickNo, arcs){
-  // continue a running serial ~55% of the time if one is ready, else maybe start one, else a one-off
-  const ready = Object.keys(arcs).filter(k => tickNo - arcs[k].tick >= ARC_MIN_GAP);
-  if(ready.length && Math.random() < 0.55){
-    const key = ready[Math.floor(Math.random() * ready.length)];
-    const nexts = (STORY_NODES[arcs[key].node] || {}).next || [];
-    if(nexts.length) return nexts[Math.floor(Math.random() * nexts.length)];
-  }
-  const free = STORY_STARTS.filter(id => !arcs[STORY_NODES[id].arc]);
-  if(free.length && Math.random() < 0.45) return free[Math.floor(Math.random() * free.length)];
-  return STORY_SINGLES[Math.floor(Math.random() * STORY_SINGLES.length)];
-}
-function makeNewsEvent(tickNo, arcs){
-  arcs = arcs || {};
-  const nodeId = pickStory(tickNo, arcs), node = STORY_NODES[nodeId];
-  const effects = [];
-  if(node.fx){
-    Object.keys(node.fx).forEach(id => {
-      const w = node.fx[id], st = stockInfo(id), d = Math.sign(w);
-      effects.push({ stock:id, dir:d, shock: d * (0.03 + Math.random()*0.04) * Math.abs(w) * node.str * TYPE_IMPACT[st.type], k: TREND_K * Math.abs(w) * 0.9 });
-    });
-  } else {
-    const main = stockInfo(node.stock);
-    const mainShock = node.dir * (0.05 + Math.random()*0.04) * node.str * TYPE_IMPACT[main.type];
-    effects.push({ stock:main.id, dir:node.dir, shock:mainShock, k: TREND_K * Math.min(1.2, 0.6 + node.str * 0.4) });
-    Object.keys(STOCK_LINKS[main.id] || {}).forEach(id => {
-      const c = STOCK_LINKS[main.id][id];
-      effects.push({ stock:id, dir: node.dir * Math.sign(c), shock: mainShock * c * 0.6, k: TREND_K * Math.abs(c) * 0.8 });
-    });
-  }
-  // serial bookkeeping
-  const nextArcs = Object.assign({}, arcs);
-  Object.keys(nextArcs).forEach(k => { if(tickNo - nextArcs[k].tick > ARC_EXPIRE) delete nextArcs[k]; });
-  if(node.arc){
-    if(node.next && node.next.length) nextArcs[node.arc] = { node: nodeId, tick: tickNo };
-    else delete nextArcs[node.arc];
-  }
-  return {
-    effects, arcs: nextArcs,
-    record: { id: 'n' + tickNo, tick: tickNo, at: tickNo * GAME_TICK_MS, node: nodeId, emoji: node.emoji, title: node.title, body: node.body,
-              arc: node.arc || null, part: node.part || null, more: !!(node.next && node.next.length),
-              stocks: effects.map(e => e.stock), dir: node.dir || 0,
-              fx: effects.map(e => ({ s: e.stock, d: e.dir, p: Math.round(e.shock * 1000) / 10 })) }
-  };
-}
 function gameTickNow(){ return Math.floor(Date.now() / GAME_TICK_MS); }
 function hmToMin(str){ const p = str.split(':').map(Number); return p[0]*60 + p[1]; }
 function marketStatus(d){
@@ -4034,136 +3834,17 @@ function nextMovingTick(){ let t = gameTickNow() + 1; for(let i = 0; i < 48 && i
 function nextTickLabel(){ const t = new Date(nextMovingTick() * GAME_TICK_MS); return pad2(t.getHours()) + ':' + pad2(t.getMinutes()); }
 function fmtWon(n){ return Math.round(n || 0).toLocaleString('ko-KR') + '원'; }
 function stockName(id){ const s = GAME_STOCKS.find(x => x.id === id); return s ? s.name : id; }
+function gameRef(sub){ return fbDb.ref(GAME_PATH + (sub ? '/' + sub : '')); }
 
-/* ---- storage: real Firebase when configured, otherwise a localStorage stand-in with the same API ---- */
-const localGameDb = (function(){
-  const KEY = 'allthing:game-local';
-  let listeners = [];
-  function load(){ try{ return JSON.parse(localStorage.getItem(KEY)) || {}; }catch(e){ return {}; } }
-  function save(d){ try{ localStorage.setItem(KEY, JSON.stringify(d)); }catch(e){} }
-  function get(d, path){ return path.split('/').reduce((o,k) => (o == null ? undefined : o[k]), d); }
-  function put(d, path, v){
-    const ks = path.split('/'); let o = d;
-    for(let i = 0; i < ks.length-1; i++){ if(o[ks[i]] == null || typeof o[ks[i]] !== 'object') o[ks[i]] = {}; o = o[ks[i]]; }
-    const last = ks[ks.length-1];
-    if(v == null) delete o[last]; else o[last] = JSON.parse(JSON.stringify(v));
-  }
-  function snap(v){ return { val: () => (v === undefined ? null : v) }; }
-  function notify(){ const d = load(); listeners.forEach(x => x.cb(snap(get(d, x.path)))); }
-  function ref(path){
-    return {
-      once(){ return Promise.resolve(snap(get(load(), path))); },
-      on(evt, cb){ listeners.push({ path, cb }); cb(snap(get(load(), path))); },
-      off(){ listeners = listeners.filter(x => x.path !== path); },
-      update(ch){ const d = load(); Object.keys(ch).forEach(k => put(d, path+'/'+k, ch[k])); save(d); notify(); return Promise.resolve(); },
-      set(v){ const d = load(); put(d, path, v); save(d); notify(); return Promise.resolve(); },
-      push(v){ const k = 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2,6); const d = load(); put(d, path+'/'+k, v); save(d); notify(); return Promise.resolve(); },
-      transaction(fn){
-        const d = load(); const cur = get(d, path);
-        const next = fn(cur === undefined ? null : JSON.parse(JSON.stringify(cur)));
-        if(next === undefined) return Promise.resolve({ committed:false, snapshot:snap(cur) });
-        put(d, path, next); save(d); notify();
-        return Promise.resolve({ committed:true, snapshot:snap(next) });
-      },
-      limitToLast(n){
-        return { once(){
-          const v = get(load(), path) || {};
-          const o = {}; Object.keys(v).sort().slice(-n).forEach(k => o[k] = v[k]);
-          return Promise.resolve(snap(o));
-        } };
-      }
-    };
-  }
-  return { ref };
-})();
-function gameDb(){ return (firebaseReady && fbDb) ? fbDb : localGameDb; }
-function gameRef(sub){ return gameDb().ref(GAME_PATH + (sub ? '/' + sub : '')); }
-
-/* ---- market engine ----
-   Each 30-minute step, a stock's move is the sum of:
-   - random noise sized by its personality (vol)
-   - a gentle pull back toward its base price (weak while a news trend is running)
-   - the news trend: a drift in the story's direction worth ~1×vol per step, fading over ~3h,
-     with the noise also calmed so the trend actually shows instead of drowning in randomness
-   - supply & demand: net money that flowed in (buys) or out (sells) since the last step
-   - theme stocks only: rare surprise jumps (not while a trend is running) */
-const GAME_TREND_STEPS = 6;          // news after-effect length in moving 30-min steps (~3h)
-const FLOW_DEPTH = 50000000;         // see flowImpact()
-const TREND_K = 0.6;                 // news drift per step as a share of the stock's own volatility (fades 20%/step)
-const TREND_NOISE = 0.9;             // noise is only slightly calmed during a trend — so news usually, not always, plays out
-function gaussRand(){ let u = 0, v = 0; while(!u) u = Math.random(); while(!v) v = Math.random(); return Math.sqrt(-2*Math.log(u)) * Math.cos(2*Math.PI*v); }
-function clampPrice(stock, v){ return Math.max(10, Math.round(Math.max(stock.base * 0.1, v) / 10) * 10); }
-// Kept deliberately small and invisible: when it was big and shown on screen, everyone piled into
-// the same stock and the crowd itself pushed prices up — a self-fulfilling pump. Now 1,000,000원 of
-// net buying nudges the next step by about +0.1%, capped at ±2% even if the whole class piles in.
+// 큰 주문은 체결가가 조금 불리해져요 (서버와 같은 계산 — "최대" 수량을 미리 맞추는 데만 써요)
+const FLOW_DEPTH = 50000000;
 function flowImpact(won){ return Math.max(-0.02, Math.min(0.02, (won || 0) / FLOW_DEPTH * 0.05)); }
-function stepPrice(stock, price, trend, flowR){
-  const drift = trend ? trend.d * trend.k * stock.vol : 0;
-  const noise = gaussRand() * stock.vol * (trend ? TREND_NOISE : 1);
-  const revert = ((stock.base - price) / stock.base) * (trend ? 0.004 : 0.02);
-  let r = noise + drift + revert + (flowR || 0);
-  if(stock.jump && !trend && Math.random() < 0.07) r += (Math.random() < 0.5 ? -1 : 1) * (0.08 + Math.random()*0.12);
-  return clampPrice(stock, price * (1 + r));
+function execPrice(side, price, qty){
+  const half = Math.abs(flowImpact(price * qty)) / 2;
+  return Math.max(10, Math.round(price * (side === 'buy' ? 1 + half : 1 - half) / 10) * 10);
 }
-function advanceMarket(m, target, extFlow){
-  if(!m || !m.prices){
-    const prices = {}, history = {};
-    GAME_STOCKS.forEach(s => { prices[s.id] = s.base; history[s.id] = [s.base]; });
-    return { tick: target, prices, prev: Object.assign({}, prices), history, trend: {}, news: [], flow: {}, lastFlow: {}, arcs: {} };
-  }
-  if(m.tick >= target) return undefined; // already current — abort the transaction, nothing to write
-  const steps = Math.min(target - m.tick, GAME_HISTORY_LEN);
-  let prices = Object.assign({}, m.prices), prev = Object.assign({}, m.prev || m.prices);
-  const history = {};
-  GAME_STOCKS.forEach(s => {
-    if(!prices[s.id]) prices[s.id] = s.base;
-    history[s.id] = (m.history && Array.isArray(m.history[s.id])) ? m.history[s.id].slice() : [prices[s.id]];
-  });
-  const trend = {};
-  Object.keys(m.trend || {}).forEach(k => { const t = m.trend[k]; if(t && typeof t.d === 'number') trend[k] = Object.assign({}, t); });
-  let news = Array.isArray(m.news) ? m.news.slice() : [];
-  const flow = Object.assign({}, m.flow || {}), lastFlow = {};
-  Object.keys(extFlow || {}).forEach(id => { flow[id] = (flow[id] || 0) + (extFlow[id] || 0); });
-  let arcs = Object.assign({}, m.arcs || {});
-  const base = target - steps;
-  for(let i = 0; i < steps; i++){
-    const tickNo = base + i + 1;
-    if(isFrozenTick(tickNo)){
-      // night: nothing moves (orders placed overnight are applied at 07:00). Flat point keeps the time axis honest.
-      GAME_STOCKS.forEach(s => { history[s.id].push(prices[s.id]); if(history[s.id].length > GAME_HISTORY_LEN) history[s.id].shift(); });
-      continue;
-    }
-    prev = prices;
-    const next = {};
-    GAME_STOCKS.forEach(s => { next[s.id] = stepPrice(s, prev[s.id], trend[s.id], flowImpact(flow[s.id])); });
-    Object.keys(flow).forEach(k => delete flow[k]);
-    Object.keys(trend).forEach(k => { trend[k].left -= 1; trend[k].k *= 0.8; if(trend[k].left <= 0) delete trend[k]; });
-    if(isNewsSlot(tickNo) && Math.random() < GAME_NEWS_PROB){
-      const ev = makeNewsEvent(tickNo, arcs);
-      arcs = ev.arcs;
-      ev.effects.forEach(ef => {
-        const st = stockInfo(ef.stock);
-        next[ef.stock] = clampPrice(st, next[ef.stock] * (1 + ef.shock));
-        trend[ef.stock] = { d: ef.dir, k: ef.k, left: GAME_TREND_STEPS, n: ev.record.id };
-      });
-      news.push(ev.record);
-      if(news.length > GAME_NEWS_KEEP) news = news.slice(-GAME_NEWS_KEEP);
-    }
-    GAME_STOCKS.forEach(s => {
-      history[s.id].push(next[s.id]);
-      if(history[s.id].length > GAME_HISTORY_LEN) history[s.id].shift();
-    });
-    prices = next;
-  }
-  // de-duplicate by id (heals feeds hit by the double-publish bug) and keep the "already published"
-  // marks — dropping them is what let the 22:25 test story fire again after every price step
-  const seenIds = new Set();
-  news = news.filter(n => n && !seenIds.has(n.id) && seenIds.add(n.id));
-  return { tick: target, prices, prev, history, trend, news, flow, arcs, published: Object.assign({}, m.published || {}) };
-}
-/* ---- game control: open / shutdown / test mode ----
-   open: everyone plays. shutdown (open:false): prices and news stop entirely. test (open:false,
-   test:true): the market runs, but only admins and chosen testers can get in. */
+
+/* ---- game control: open / shutdown / test mode ---- */
 const GAME_CTRL_DEFAULT = { open:true, test:false, testers:{}, season:'s1' };
 function gameCtrl(){ return Object.assign({}, GAME_CTRL_DEFAULT, (state.game && state.game.control) || {}); }
 function marketRunning(c){ c = c || gameCtrl(); return !!(c.open || c.test); }
@@ -4173,58 +3854,20 @@ function canPlayGame(){
   return !!c.test && (isAdmin() || !!(c.testers || {})[state.currentUser]);
 }
 function logPath(){ return 'log/' + (gameCtrl().season || 's1'); }
-async function ensureMarketCurrent(){
-  if(!marketRunning()) return;
-  const g = state.game, target = gameTickNow();
-  if(g.market && g.market.tick >= target) return;
-  if(g.advancing) return;
-  g.advancing = true;
+
+/* ---- 서버와 맞추기: 시세 진행 + 지원금 + 자동 손절·익절 ---- */
+async function gameSync(){
+  const g = state.game;
+  if(!state.currentUser || !canPlayGame() || g.syncing) return;
+  g.syncing = true;
   try{
-    const flow = (await withTimeout(gameRef('flow').once('value').then(s => s.val()), 4000, null)) || {};
-    const res = await withTimeout(gameRef('market').transaction(cur => advanceMarket(cur, target, flow)), 8000, null);
-    if(res && res.committed){
-      // this step used up the flow it read; leave anything that arrived meanwhile for the next step
-      Object.keys(flow).forEach(id => { gameRef('flow/' + id).transaction(c => { const v = (c || 0) - flow[id]; return Math.abs(v) < 1 ? null : v; }); });
-    }
-  }catch(e){}
-  g.advancing = false;
-}
-
-/* ---- scheduled one-off news (published by whoever has the game open after the time) ---- */
-const SCHEDULED_NEWS = [
-  // add one-off stories here: { id:'sched-YYYYMMDD-HHMM', at: new Date(y, m-1, d, h, mi).getTime(), until: … }
-  // (the 2026-10-06 22:25 test story has already been published and is retired)
-];
-async function publishScheduledNews(){
-  if(!marketRunning()) return;
-  const now = Date.now(), m = state.game.market;
-  for(const x of SCHEDULED_NEWS){
-    if(now < x.at || now > x.until) continue;
-    if(m && (m.published || {})[x.id]) continue;
-    await withTimeout(gameRef('market').transaction(cur => {
-      if(!cur || !cur.prices || (cur.published || {})[x.id]) return undefined;
-      if((cur.news || []).some(n => n && n.id === x.id)) return undefined; // second guard: never publish the same story twice
-      const ev = makeNewsEvent(cur.tick, cur.arcs || {});
-      const prices = Object.assign({}, cur.prices), history = {}, trend = Object.assign({}, cur.trend || {});
-      GAME_STOCKS.forEach(s => { history[s.id] = ((cur.history || {})[s.id] || [prices[s.id]]).slice(); });
-      ev.effects.forEach(ef => {
-        const st = stockInfo(ef.stock);
-        prices[ef.stock] = clampPrice(st, prices[ef.stock] * (1 + ef.shock));
-        history[ef.stock][history[ef.stock].length - 1] = prices[ef.stock];
-        trend[ef.stock] = { d: ef.dir, k: ef.k, left: GAME_TREND_STEPS, n: x.id };
-      });
-      const rec = Object.assign({}, ev.record, { id: x.id, at: x.at });
-      cur.prev = cur.prices; cur.prices = prices; cur.history = history; cur.trend = trend; cur.arcs = ev.arcs;
-      cur.news = (Array.isArray(cur.news) ? cur.news : []).concat([rec]).slice(-GAME_NEWS_KEEP);
-      cur.published = Object.assign({}, cur.published || {}, { [x.id]: true });
-      return cur;
-    }), 8000, null);
+    const r = await api('game', { action:'sync' });
+    if(state.game === g && r.messages && r.messages.length) showToast(r.messages.join(' · '));
+  }catch(e){
+    if(e.status === 401) forceRelogin(e.message);
+    else if(e.status !== 403) console.warn('All thing: 게임 동기화 실패 —', e.message);
   }
-}
-
-/* ---- player wallet ---- */
-function playerDefaults(){
-  return { cash: GAME_START_CASH, holdings:{}, cost:{}, items:{}, lastAllowance: todayStr(), daily:{ date: todayStr() }, joined: Date.now() };
+  g.syncing = false;
 }
 function playerTotals(p, prices){
   p = p || {}; prices = prices || {};
@@ -4232,83 +3875,45 @@ function playerTotals(p, prices){
   Object.keys(p.holdings || {}).forEach(id => { stockValue += (p.holdings[id] || 0) * (prices[id] || 0); });
   return { cash: p.cash || 0, stockValue, total: (p.cash || 0) + stockValue };
 }
-async function claimDailyAllowance(){
-  const id = state.currentUser; if(!id) return;
-  let created = false, granted = false;
-  const res = await withTimeout(gameRef('players/' + id).transaction(cur => {
-    created = false; granted = false;
-    if(!cur){ created = true; return playerDefaults(); }
-    if(cur.lastAllowance !== todayStr()){
-      cur.cash = (cur.cash || 0) + GAME_DAILY_CASH;
-      cur.lastAllowance = todayStr();
-      granted = true;
-      return cur;
+// 내 자동 매도 조건이 시세 기록에서 맞았는지 (맞으면 서버에 처리를 부탁해요)
+function findOrderTriggers(orders, m){
+  const out = [];
+  if(!orders || !m || !m.history) return out;
+  Object.keys(orders).forEach(id => {
+    const o = orders[id], arr = m.history[o.stock];
+    if(!o || !arr || !arr.length) return;
+    const first = m.tick - (arr.length - 1);
+    for(let t = Math.max((o.tick || 0) + 1, first); t <= m.tick; t++){
+      const price = arr[arr.length - 1 - (m.tick - t)];
+      if((o.kind === 'stop' && price <= o.trigger) || (o.kind === 'take' && price >= o.trigger)){ out.push({ id, price, tick: t }); break; }
     }
-    return undefined;
-  }), 8000, null);
-  if(res && res.committed){
-    if(created) showToast('주식게임 시작! 시작 자금 ' + fmtWon(GAME_START_CASH) + '을 받았어요.');
-    else if(granted) showToast('오늘의 지원금 ' + fmtWon(GAME_DAILY_CASH) + '을 받았어요.');
-    gameLog({ type: created ? 'start' : 'allowance', amount: created ? GAME_START_CASH : GAME_DAILY_CASH });
-  }
+  });
+  return out;
 }
-function gameLog(entry){
-  try{ const r = gameRef(logPath()).push(Object.assign({ uid: state.currentUser, at: Date.now() }, entry)); if(r && r.catch) r.catch(() => {}); }catch(e){}
+function checkAutoOrders(){
+  const g = state.game;
+  if(g.player && g.player.orders && g.market && findOrderTriggers(g.player.orders, g.market).length) gameSync();
+}
+async function gameAction(body){
+  const g = state.game;
+  if(g.busy) return null;
+  g.busy = true;
+  try{ return await apiToast('game', body); }
+  finally{ g.busy = false; }
 }
 
 /* ---- trading ---- */
-// Big orders move the price against you while they fill (half of their own supply/demand impact).
-// This also stops "buy a lot, let my own buying lift the price, sell" from being free money.
-function execPrice(side, price, qty){
-  const half = Math.abs(flowImpact(price * qty)) / 2;
-  return Math.max(10, Math.round(price * (side === 'buy' ? 1 + half : 1 - half) / 10) * 10);
-}
-function recordFlow(stockId, won){
-  // stored OUTSIDE the market node: anything written inside it is pushed to every open game screen
-  try{ const r = gameRef('flow/' + stockId).transaction(cur => (cur || 0) + Math.round(won)); if(r && r.catch) r.catch(() => {}); }catch(e){}
-}
 async function gameTrade(side, stockId){
   const st = marketStatus();
   if(!st.open && side === 'buy'){ showToast('수업 시간에는 매수할 수 없어요 (매도는 가능해요). ' + st.reopen + '에 다시 열려요.', 'err'); return; }
   const g = state.game;
   if(!g.market || !g.market.prices || !g.playerLoaded){ showToast('시장 정보를 불러오는 중이에요.', 'err'); return; }
-  if(g.market.tick < gameTickNow()) await ensureMarketCurrent();
-  const price = g.market.prices[stockId];
   const qty = Math.floor(Number(g.qty[stockId] || 0));
   if(!(qty > 0)){ showToast('수량을 입력해주세요.', 'err'); return; }
-  if(!(price > 0)){ showToast('시세를 확인할 수 없어요.', 'err'); return; }
-  const fill = execPrice(side, price, qty);
-  let err = '';
-  const res = await withTimeout(gameRef('players/' + state.currentUser).transaction(cur => {
-    err = '';
-    if(!cur) cur = playerDefaults();
-    cur.holdings = cur.holdings || {}; cur.cost = cur.cost || {};
-    const have = cur.holdings[stockId] || 0;
-    if(side === 'buy'){
-      const total = fill * qty;
-      if((cur.cash || 0) < total){ err = '현금이 부족해요.'; return undefined; }
-      cur.cash -= total;
-      cur.cost[stockId] = Math.round(((cur.cost[stockId] || 0) * have + total) / (have + qty));
-      cur.holdings[stockId] = have + qty;
-    } else {
-      if(have < qty){ err = '보유한 수량보다 많이 팔 수 없어요.'; return undefined; }
-      cur.cash = (cur.cash || 0) + fill * qty;
-      cur.holdings[stockId] = have - qty;
-      if(cur.holdings[stockId] === 0){
-        delete cur.holdings[stockId]; delete cur.cost[stockId];
-        Object.keys(cur.orders || {}).forEach(oid => {
-          if(cur.orders[oid].stock === stockId){ delete cur.orders[oid]; cur.items = cur.items || {}; cur.items.autoOrder = (cur.items.autoOrder || 0) + 1; }
-        });
-      }
-    }
-    return cur;
-  }), 8000, null);
-  if(err){ showToast(err, 'err'); return; }
-  if(!res || !res.committed){ showToast('거래하지 못했어요. 잠시 후 다시 시도해주세요.', 'err'); return; }
+  const r = await gameAction({ action:'trade', side, stock: stockId, qty });
+  if(!r) return;
   g.qty[stockId] = '';
-  recordFlow(stockId, (side === 'buy' ? 1 : -1) * fill * qty);
-  gameLog({ type: side, stock: stockId, qty, price: fill });
-  showToast(stockName(stockId) + ' ' + qty + '주 ' + (side === 'buy' ? '매수' : '매도') + ' 완료 · 체결가 ' + fmtWon(fill));
+  showToast(r.message);
 }
 function gameSetMax(side, stockId){
   const g = state.game, price = g.market && g.market.prices ? g.market.prices[stockId] : 0, p = g.player || {};
@@ -4323,92 +3928,16 @@ function gameSetMax(side, stockId){
 /* ---- items ---- */
 async function gameBuyItem(itemId){
   const item = GAME_ITEMS.find(x => x.id === itemId); if(!item) return;
-  let err = '', won = null;
-  const res = await withTimeout(gameRef('players/' + state.currentUser).transaction(cur => {
-    err = '';
-    if(!cur) cur = playerDefaults();
-    cur.items = cur.items || {};
-    if(!cur.daily || cur.daily.date !== todayStr()) cur.daily = { date: todayStr() };
-    const bought = cur.daily[itemId] || 0;
-    if(bought >= item.dailyLimit){ err = item.name + '은(는) 하루에 ' + item.dailyLimit + '개까지만 살 수 있어요.'; return undefined; }
-    if((cur.cash || 0) < item.price){ err = '현금이 부족해요.'; return undefined; }
-    cur.cash -= item.price;
-    cur.daily[itemId] = bought + 1;
-    if(item.instant){
-      won = drawLotto();          // re-drawn if Firebase retries; whatever commits is what's shown
-      cur.cash += won.amount;
-    } else {
-      cur.items[itemId] = (cur.items[itemId] || 0) + 1;
-    }
-    return cur;
-  }), 8000, null);
-  if(err){ showToast(err, 'err'); return; }
-  if(!res || !res.committed){ showToast('구매하지 못했어요. 잠시 후 다시 시도해주세요.', 'err'); return; }
-  if(item.instant && won){
-    gameLog({ type:'lotto', price: item.price, prize: won.amount, tier: won.tier });
-    state.game.lottoResult = { tier: won.tier, label: won.label, amount: won.amount, at: Date.now() };
+  const r = await gameAction({ action:'buyItem', item: itemId });
+  if(!r) return;
+  if(r.lotto){
+    state.game.lottoResult = Object.assign({ at: Date.now() }, r.lotto);
     render();
     return;
   }
-  gameLog({ type:'item', item: itemId, price: item.price });
-  showToast(item.name + '을(를) 샀어요.');
+  showToast(r.message || (item.name + '을(를) 샀어요.'));
 }
-/* ---- auto stop-loss / take-profit orders ----
-   Orders live in the player's own wallet node. There's no server to watch prices, so the
-   owner's app checks them whenever the market updates — but it sells at the price of the
-   30-minute step where the condition was FIRST met (read from the price history), so opening
-   the app late never changes the outcome. A transaction makes sure each order runs once. */
-function playerTxn(fn){ return withTimeout(gameRef('players/' + state.currentUser).transaction(fn), 8000, null); }
-function findOrderTriggers(orders, m){
-  const out = [];
-  if(!orders || !m || !m.history) return out;
-  Object.keys(orders).forEach(id => {
-    const o = orders[id], arr = m.history[o.stock];
-    if(!arr || !arr.length) return;
-    const first = m.tick - (arr.length - 1);
-    for(let t = Math.max((o.tick || 0) + 1, first); t <= m.tick; t++){
-      const price = arr[arr.length - 1 - (m.tick - t)];
-      if((o.kind === 'stop' && price <= o.trigger) || (o.kind === 'take' && price >= o.trigger)){ out.push({ id, price, tick: t }); break; }
-    }
-  });
-  return out;
-}
-async function processAutoOrders(){
-  const g = state.game, m = g.market, p = g.player;
-  if(!state.currentUser || !m || !p || !p.orders || g.processingOrders) return;
-  if(!findOrderTriggers(p.orders, m).length) return;
-  g.processingOrders = true;
-  const done = [];
-  const res = await playerTxn(cur => {
-    done.length = 0;
-    if(!cur || !cur.orders) return undefined;
-    const hits = findOrderTriggers(cur.orders, m);
-    if(!hits.length) return undefined;
-    cur.holdings = cur.holdings || {}; cur.cost = cur.cost || {}; cur.items = cur.items || {};
-    hits.forEach(h => {
-      const o = cur.orders[h.id]; delete cur.orders[h.id];
-      const have = cur.holdings[o.stock] || 0, q = Math.min(o.qty, have);
-      if(q <= 0){ cur.items.autoOrder = (cur.items.autoOrder || 0) + 1; done.push({ stock:o.stock, kind:o.kind, qty:0 }); return; }
-      cur.cash = (cur.cash || 0) + h.price * q;
-      cur.holdings[o.stock] = have - q;
-      if(cur.holdings[o.stock] === 0){ delete cur.holdings[o.stock]; delete cur.cost[o.stock]; }
-      done.push({ stock:o.stock, kind:o.kind, qty:q, price:h.price, tick:h.tick });
-    });
-    return cur;
-  });
-  g.processingOrders = false;
-  if(res && res.committed){
-    done.forEach(d => {
-      if(d.qty > 0){
-        recordFlow(d.stock, -d.price * d.qty);
-        gameLog({ type:'auto', stock:d.stock, kind:d.kind, qty:d.qty, price:d.price, tick:d.tick });
-        showToast('⚡ 자동 ' + (d.kind === 'stop' ? '손절' : '익절') + ': ' + stockName(d.stock) + ' ' + d.qty + '주를 ' + fmtWon(d.price) + '에 팔았어요.');
-      } else {
-        showToast(stockName(d.stock) + '을(를) 더 이상 갖고 있지 않아 예약이 취소됐어요. 예약권은 돌려드렸어요.');
-      }
-    });
-  }
-}
+/* ---- auto stop-loss / take-profit orders ---- */
 function openOrderForm(stockId){
   const g = state.game;
   g.orderForm = (g.orderForm && g.orderForm.stock === stockId) ? null : { stock: stockId, kind:'stop', trigger:'', qty:'' };
@@ -4420,76 +3949,26 @@ async function placeAutoOrder(stockId){
   const now = m.prices[stockId], have = (p.holdings || {})[stockId] || 0;
   const kind = f.kind === 'take' ? 'take' : 'stop';
   const trigger = Math.round(Number(f.trigger || 0) / 10) * 10;
-  const sellAll = !String(f.qty || '').trim(); // blank = "everything I hold", resolved against the real wallet at save time
+  const sellAll = !String(f.qty || '').trim(); // blank = "everything I hold"
   const qty = sellAll ? null : Math.floor(Number(f.qty));
   if(!(trigger > 0)){ showToast('가격을 입력해주세요.', 'err'); return; }
   if(kind === 'stop' && trigger >= now){ showToast('손절 가격은 지금 가격(' + fmtWon(now) + ')보다 낮아야 해요.', 'err'); return; }
   if(kind === 'take' && trigger <= now){ showToast('익절 가격은 지금 가격(' + fmtWon(now) + ')보다 높아야 해요.', 'err'); return; }
   if(!sellAll && (!(qty > 0) || qty > have)){ showToast('수량은 1주부터 보유한 ' + have + '주까지 정할 수 있어요.', 'err'); return; }
-  let err = '', placedQty = 0;
-  const res = await playerTxn(cur => {
-    err = '';
-    if(!cur || !cur.items || !(cur.items.autoOrder > 0)){ err = '예약권이 없어요. 상점에서 살 수 있어요.'; return undefined; }
-    const held = (cur.holdings || {})[stockId] || 0, q = sellAll ? held : qty;
-    if(!(q > 0) || q > held){ err = held ? '보유한 수량(' + held + '주)보다 많이 걸 수 없어요.' : '이 주식을 더 이상 갖고 있지 않아요.'; return undefined; }
-    placedQty = q;
-    cur.items.autoOrder -= 1;
-    cur.orders = cur.orders || {};
-    cur.orders['o' + Date.now().toString(36) + Math.random().toString(36).slice(2,6)] = { stock: stockId, kind, trigger, qty: q, tick: m.tick, at: Date.now() };
-    return cur;
-  });
-  if(err){ showToast(err, 'err'); return; }
-  if(!res || !res.committed){ showToast('예약하지 못했어요. 잠시 후 다시 시도해주세요.', 'err'); return; }
-  gameLog({ type:'orderSet', stock: stockId, kind, trigger, qty: placedQty });
+  const r = await gameAction({ action:'placeOrder', stock: stockId, kind, trigger, qty });
+  if(!r) return;
   g.orderForm = null;
-  showToast(stockName(stockId) + ' ' + (kind === 'stop' ? '손절' : '익절') + ' 예약 완료 · ' + fmtWon(trigger) + (kind === 'stop' ? ' 이하' : ' 이상'));
+  showToast(r.message);
 }
 async function cancelAutoOrder(orderId){
-  let stock = '';
-  const res = await playerTxn(cur => {
-    if(!cur || !cur.orders || !cur.orders[orderId]) return undefined;
-    stock = cur.orders[orderId].stock;
-    delete cur.orders[orderId];
-    cur.items = cur.items || {}; cur.items.autoOrder = (cur.items.autoOrder || 0) + 1;
-    return cur;
-  });
-  if(res && res.committed){ gameLog({ type:'orderCancel', stock }); showToast('예약을 취소했어요. 예약권은 돌려드렸어요.'); }
+  const r = await gameAction({ action:'cancelOrder', orderId });
+  if(r) showToast(r.message);
 }
 async function useNewsSummary(newsId){
   const g = state.game, p = g.player || {};
-  if((p.summaries || {})[newsId]) return; // already unlocked
-  const liveIds = new Set(((g.market || {}).news || []).map(n => n.id));
-  let err = '';
-  const res = await playerTxn(cur => {
-    err = '';
-    if(!cur || !cur.items || !(cur.items.newsSummary > 0)){ err = '뉴스 요약이 없어요. 상점에서 살 수 있어요.'; return undefined; }
-    cur.items.newsSummary -= 1;
-    const keep = {};
-    Object.keys(cur.summaries || {}).forEach(k => { if(liveIds.has(k)) keep[k] = 1; }); // forget summaries of news that left the feed
-    keep[newsId] = 1;
-    cur.summaries = keep;
-    return cur;
-  });
-  if(err){ showToast(err, 'err'); return; }
-  if(!res || !res.committed){ showToast('요약을 열지 못했어요. 잠시 후 다시 시도해주세요.', 'err'); return; }
-  gameLog({ type:'use', item:'newsSummary' });
-}
-async function refundLegacyItems(){
-  let refund = 0;
-  const res = await playerTxn(cur => {
-    refund = 0;
-    if(!cur || !cur.items) return undefined;
-    Object.keys(LEGACY_ITEMS).forEach(k => {
-      if(k in cur.items){ refund += (cur.items[k] || 0) * LEGACY_ITEMS[k].price; delete cur.items[k]; }
-    });
-    if(!refund) return undefined;
-    cur.cash = (cur.cash || 0) + refund;
-    return cur;
-  });
-  if(res && res.committed && refund){
-    gameLog({ type:'refund', amount: refund });
-    showToast('힌트 아이템이 사라져서, 안 쓴 힌트 값 ' + fmtWon(refund) + '을 돌려드렸어요.');
-  }
+  const cur = (p.summaries || {})[newsId];
+  if(cur && typeof cur === 'object') return; // already unlocked
+  await gameAction({ action:'useSummary', newsId });
 }
 
 /* ---- ranking & history ---- */
@@ -4537,7 +4016,7 @@ function startGameSync(){
   // only the tiny control node is watched for everyone; the market and wallets are loaded
   // only once someone who is allowed in actually opens the game tab
   const g = state.game;
-  if(!state.currentUser || g.syncedFor === state.currentUser) return;
+  if(!state.currentUser || !fbDb || g.syncedFor === state.currentUser) return;
   if(g.syncedFor) stopGameSync();
   const gg = state.game;
   gg.syncedFor = state.currentUser;
@@ -4547,9 +4026,9 @@ function startGameSync(){
     gg.control = snap.val() || null; gg.controlLoaded = true;
     if(!canPlayGame()) detachPlay();
     else if(gg.wantPlay) attachPlay();
-    if(gg.playAttached && !marketRunning(was) && marketRunning()) ensureMarketCurrent();
+    if(gg.playAttached && !marketRunning(was) && marketRunning()) gameSync();
     if(state.view === 'game' || state.view === 'accounts') renderGameSafe();
-  });
+  }, () => { gg.controlLoaded = true; renderGameSafe(); });
 }
 function attachPlay(){
   const gg = state.game;
@@ -4561,14 +4040,13 @@ function attachPlay(){
   marketRef.on('value', snap => {
     if(!gg.playAttached || state.game !== gg) return; // arrived after we disconnected (locked / logged out)
     gg.market = snap.val(); gg.marketLoaded = true;
-    if(!gg.market && marketRunning()) ensureMarketCurrent(); // e.g. right after a reset
+    if(!gg.market && marketRunning()) gameSync(); // e.g. right after a reset
     const news = (gg.market && gg.market.news) || [], latest = news.length ? news[news.length-1] : null;
     if(latest && gg.lastNewsId !== null && latest.id !== gg.lastNewsId && state.view === 'game'){
       showToast('📰 새 소식: ' + latest.title);
     }
     gg.lastNewsId = latest ? latest.id : '';
-    processAutoOrders();
-    publishScheduledNews();
+    checkAutoOrders();
     if(state.view === 'game'){
       if(gg.tab === 'news' && latest) lsSet('game-news-seen', false, latest.id);
       renderGameSafe();
@@ -4577,27 +4055,24 @@ function attachPlay(){
   playerRef.on('value', snap => {
     if(!gg.playAttached || state.game !== gg) return;
     gg.player = snap.val(); gg.playerLoaded = true;
-    if(!gg.player && marketRunning()) claimDailyAllowance(); // wallet wiped by a reset → start again
-    processAutoOrders();
+    if(!gg.player && marketRunning()) gameSync(); // wallet wiped by a reset → start again
     if(state.view === 'game') renderGameSafe();
   });
-  ensureMarketCurrent().then(claimDailyAllowance).then(refundLegacyItems).then(processAutoOrders).then(publishScheduledNews);
+  gameSync(); // 시세를 지금까지 진행 + 오늘 지원금 + 자동 매도 (전부 서버에서)
   gg.timer = setInterval(() => {
     if(state.view !== 'game') return;
-    publishScheduledNews();
     const key = gameTickNow() + '|' + todayStr() + '|' + JSON.stringify(marketStatus());
     if(key !== gg.statusKey){
-      const dayChanged = gg.statusKey && gg.statusKey.split('|')[1] !== todayStr();
+      const first = !gg.statusKey;
       gg.statusKey = key;
-      ensureMarketCurrent();
-      if(dayChanged) claimDailyAllowance();
+      if(!first) gameSync();
       renderGameSafe();
     }
   }, 15000);
 }
 function freshGameState(){
-  return { tab:'market', chartOpen:null, orderForm:null, lottoResult:null, processingOrders:false, lastNewsId:null, market:null, player:null, marketLoaded:false, playerLoaded:false, qty:{}, hint:null,
-           ranking:null, log:null, syncedFor:null, playRefs:[], ctrlRef:null, timer:null, statusKey:'', advancing:false,
+  return { tab:'market', chartOpen:null, orderForm:null, lottoResult:null, lastNewsId:null, market:null, player:null, marketLoaded:false, playerLoaded:false, qty:{}, hint:null,
+           ranking:null, log:null, syncedFor:null, playRefs:[], ctrlRef:null, timer:null, statusKey:'', syncing:false, busy:false,
            control:null, controlLoaded:false, wantPlay:false, playAttached:false };
 }
 
@@ -4623,8 +4098,9 @@ function renderStockChart(s, m){
   const line = arr.map((v,i) => (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1)).join(' ');
   const area = line + ` L ${x(arr.length-1).toFixed(1)} ${H - P} L ${x(0).toFixed(1)} ${H - P} Z`;
   const ch = changeInfo(arr[arr.length-1], arr[0]);
-  // where each news story about this stock landed on the chart
-  const marks = (m.news || []).map(n => ({ n, e: newsEffects(n).find(e => e.s === s.id) })).filter(x => x.e).map(({ n, e }) => {
+  // where each news story about this stock landed on the chart — only for stories I've unlocked with a 뉴스 요약
+  const sums = ((state.game.player || {}).summaries) || {};
+  const marks = (m.news || []).filter(n => n && summaryStocks(sums[n.id]).indexOf(s.id) !== -1).map(n => {
     const idx = arr.length - 1 - (m.tick - n.tick);
     if(idx < 0 || idx >= arr.length) return '';
     return `<circle cx="${x(idx).toFixed(1)}" cy="${y(arr[idx]).toFixed(1)}" r="4.2" class="news-mark"><title>${esc(n.title)}</title></circle>`;
@@ -4652,17 +4128,10 @@ function changeInfo(now, before){
   return { cls: pct > 0 ? 'up' : 'down', text: (pct > 0 ? '▲ ' : '▼ ') + Math.abs(pct).toFixed(2) + '%' };
 }
 function fmtMan(won){ const a = Math.abs(won); return a >= 10000 ? (Math.round(a / 1000) / 10) + '만원' : Math.round(a).toLocaleString('ko-KR') + '원'; }
-function flowLine(m, id){
-  const now = (m.flow || {})[id] || 0;
-  if(Math.abs(now) < 1000) return `<div class="flow-line flat">수급 · 이번 30분 거래 적음</div>`;
-  const pct = flowImpact(now) * 100;
-  return `<div class="flow-line ${now > 0 ? 'up' : 'down'}">수급 · 이번 30분 ${now > 0 ? '매수세 우세' : '매도세 우세'} ${now > 0 ? '+' : '−'}${fmtMan(now)}
-    <span class="text-3">(다음 변동에 약 ${pct > 0 ? '+' : ''}${pct.toFixed(1)}% 영향)</span></div>`;
-}
 function renderGameMarket(){
   const g = state.game, m = g.market, p = g.player || {}, open = marketStatus().open;
   return `<div class="list">${GAME_STOCKS.map(s => {
-    const price = m.prices[s.id] || s.base;
+    const price = m.prices[s.id] || 0;
     const ch = changeInfo(price, (m.prev || {})[s.id]);
     const have = (p.holdings || {})[s.id] || 0;
     return `
@@ -4740,39 +4209,31 @@ function renderGameMine(){
     </div></div>`;
   }).join('')}</div>`;
 }
-function newsEffects(n){ return Array.isArray(n.fx) ? n.fx : (n.stocks || []).map(id => ({ s:id, d:n.dir, p:0 })); }
+function summaryStocks(sum){ return (sum && typeof sum === 'object' && Array.isArray(sum.stocks)) ? sum.stocks : []; }
 function latestNewsId(){ const n = ((state.game.market || {}).news || []); return n.length ? n[n.length-1].id : ''; }
 function hasUnreadNews(){ const id = latestNewsId(); return !!id && lsGet('game-news-seen', false, '') !== id; }
-function strengthLabel(stockId, pct){
-  const st = stockInfo(stockId), rel = Math.abs(pct) / (TYPE_IMPACT[st.type] || 1); // compare fairly across personalities
-  return rel >= 6 ? '강함' : rel >= 3 ? '보통' : '약함';
-}
-function renderNewsAnalysis(n, active){
+function renderNewsAnalysis(n, active, sum){
   // What the summary tells you: WHICH stocks the article is about, which others may get dragged
   // along, and how big the story is. What it never tells you: up or down. That's still your call.
-  const fx = newsEffects(n);
-  if(!fx.length) return '';
-  const node = STORY_NODES[n.node] || {};
-  let about, also = [];
-  if(node.stock){
-    const main = stockInfo(node.stock);
+  // (서버가 계산해서 내 지갑에 넣어준 요약이에요 — 이 기기에는 정답 자체가 오지 않아요.)
+  const ab = sum.about || {};
+  let about;
+  if(ab.kind === 'stock'){
+    const main = stockInfo(ab.id) || { name: ab.id, sector: '' };
     about = `<b>${esc(main.name)}</b> <span class="text-3">(${esc(main.sector)} 업종)</span>`;
-    also = fx.filter(e => e.s !== node.stock).map(e => stockName(e.s));
-  } else if(fx.length >= GAME_STOCKS.length){
+  } else if(ab.kind === 'all'){
     about = '<b>학교 전체</b> <span class="text-3">(모든 종목이 영향을 받을 수 있어요)</span>';
   } else {
-    about = fx.map(e => '<b>' + esc(stockName(e.s)) + '</b>').join(', ') + ' <span class="text-3">(종목마다 받는 영향이 다를 수 있어요)</span>';
+    about = (ab.ids || []).map(id => '<b>' + esc(stockName(id)) + '</b>').join(', ') + ' <span class="text-3">(종목마다 받는 영향이 다를 수 있어요)</span>';
   }
-  const mainFx = node.stock ? fx.find(e => e.s === node.stock) : fx.reduce((a, e) => Math.abs(e.p) > Math.abs(a.p) ? e : a, fx[0]);
-  const lvl = mainFx && mainFx.p ? strengthLabel(mainFx.s, mainFx.p) : '보통';
-  const size = lvl === '강함' ? '큰 소식' : lvl === '보통' ? '보통 소식' : '작은 소식';
+  const also = (sum.also || []).map(stockName);
   return `
   <div class="news-analysis">
     <div class="analysis-head">🔍 뉴스 요약</div>
     <div class="analysis-line"><span>이 기사의 주인공</span><span>${about}</span></div>
     ${also.length ? `<div class="analysis-line"><span>덩달아 흔들릴 수 있는 종목</span><span>${also.map(esc).join(', ')}</span></div>` : ''}
-    <div class="analysis-line"><span>소식의 크기</span><span><b>${size}</b></span></div>
-    ${n.arc ? `<div class="analysis-line"><span>연재</span><span>${esc(ARC_NAMES[n.arc] || '')} ${n.part}편 · ${n.more ? '다음 편이 남아 있어요' : '여기서 마무리'}</span></div>` : ''}
+    <div class="analysis-line"><span>소식의 크기</span><span><b>${esc(sum.size || '보통 소식')}</b></span></div>
+    ${n.arc ? `<div class="analysis-line"><span>연재</span><span>${esc(ARC_NAMES[n.arc] || '')} ${n.part}편 · ${sum.more ? '다음 편이 남아 있어요' : '여기서 마무리'}</span></div>` : ''}
     <p class="text-3 small">${active ? '영향은 몇 시간 더 이어질 수 있어요. ' : '이 소식의 영향은 이미 끝났어요. '}좋은 소식인지 나쁜 소식인지는 기사를 읽고 직접 판단해보세요!</p>
   </div>`;
 }
@@ -4780,18 +4241,18 @@ function renderGameNews(){
   const g = state.game, m = g.market, p = g.player || {};
   const once = new Set(), list = (m.news || []).filter(n => n && !once.has(n.id) && once.add(n.id)).reverse();
   const tickets = (p.items || {}).newsSummary || 0, unlocked = p.summaries || {};
-  const intro = `<p class="text-3 small" style="margin:0 0 10px;">학교 소식이 아침, 쉬는 시간, 저녁에 가끔 들어와요. 어떤 종목에 좋은 소식인지는 직접 추리해보세요. 뉴스가 나오면 관련 종목이 바로 움직이고, 몇 시간 동안 흐름이 이어질 수 있어요.</p>`;
+  const intro = `<p class="text-3 small" style="margin:0 0 10px;">학교 소식이 아침, 쉬는 시간, 저녁에 가끔 들어와요. 어떤 종목에 좋은 소식인지는 직접 추리해보세요. 뉴스가 나오면 관련 종목이 바로 움직이고, 몇 시간 동안 흐름이 이어질 수 있어요. 끝난 소식은 하루가 지나거나 새 소식이 6개 나오면 정리돼요.</p>`;
   if(!list.length) return intro + `<div class="empty-state">${icon('notice')}<p>아직 들어온 뉴스가 없어요.</p></div>`;
-  const activeIds = new Set(Object.values(m.trend || {}).map(t => t && t.n).filter(Boolean));
+  const activeIds = m.active || {};
   return intro + `<div class="list">${list.map(n => {
-    const active = activeIds.has(n.id), open = !!unlocked[n.id], legacy = !n.node;
+    const sum = unlocked[n.id], active = !!activeIds[n.id], open = !!(sum && typeof sum === 'object'), legacy = !n.sum;
     return `
     <div class="list-item news-item ${active ? 'active' : 'past'}"><div class="list-item-body">
       <div class="row-head"><span class="text-3 small">${timeLabel(n.at || n.tick * GAME_TICK_MS)}</span>${active ? '<span class="badge news-live">🔥 영향 진행 중</span>' : '<span class="badge badge-alt">지난 뉴스</span>'}</div>
       ${n.arc ? `<div class="news-serial">📚 연재 · ${esc(ARC_NAMES[n.arc] || '')} ${n.part}편</div>` : ''}
       <div class="news-title">${esc(n.emoji)} ${esc(n.title)}</div>
       <div class="row-sub news-body">${esc(n.body)}</div>
-      ${legacy ? '' : open ? renderNewsAnalysis(n, active) : `
+      ${legacy ? '' : open ? renderNewsAnalysis(n, active, sum) : `
       <div class="item-actions">
         <button type="button" class="btn btn-ghost btn-sm" data-act="newsSummary" data-id="${esc(n.id)}" ${tickets ? '' : 'disabled'}>🔍 뉴스 요약 보기</button>
         <span class="text-3 small">${tickets ? '요약권 ' + tickets + '장' : '요약권이 없어요 · 상점에서 구매'}</span>

@@ -1,0 +1,9 @@
+{
+  "name": "all-thing",
+  "private": true,
+  "description": "All thing — 우리 반 정보 웹앱 (Vercel 서버 함수 포함)",
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "firebase-admin": "^13.0.0"
+  }
+}
