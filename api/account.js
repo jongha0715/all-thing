@@ -8,6 +8,11 @@
    - delete {id}                                 : (관리자) 계정 삭제 — 게임 기록·안 쓰는 시간표도 같이 지워요 */
 const fb = require('./_lib/fb');
 const { handler, httpErr, requireUser, requireAdmin, validId, USERS } = require('./_lib/http');
+// 관리자 계정(다른 관리자)의 비밀번호·아이디·삭제는 최고 관리자만 할 수 있어요
+function guardTarget(ctx, target){
+  if(target && target.isSuper && !ctx.isSuper) throw httpErr(403, '최고 관리자 계정은 바꿀 수 없어요.');
+  if(target && target.isAdmin && !ctx.isSuper) throw httpErr(403, '관리자 계정은 최고 관리자만 바꿀 수 있어요.');
+}
 const { SECRET_AUTH, makeSecret } = require('./_lib/pw');
 
 const PLAYERS = 'allthing/allthing-game/players';
@@ -35,6 +40,7 @@ module.exports = handler(async (req, b) => {
   if(action === 'setPassword' || action === 'resetPassword'){
     const user = (await d.ref(USERS + '/' + id).once('value')).val();
     if(!user) throw httpErr(404, '없는 계정이에요.');
+    if(id !== ctx.uid) guardTarget(ctx, user);
     const reset = action === 'resetPassword';
     const pw = reset ? id : cleanPw(b.pw);
     if(!reset) needPw(pw);
@@ -61,9 +67,11 @@ module.exports = handler(async (req, b) => {
     const user = uS.val();
     if(!user) throw httpErr(404, '없는 계정이에요.');
     if(nS.val()) throw httpErr(409, '이미 사용 중인 아이디예요.');
+    if(id !== ctx.uid) guardTarget(ctx, user);
     const record = Object.assign({}, user, { displayName: cleanName(b.name, user.displayName || newId) });
-    if(typeof b.isAdmin === 'boolean') record.isAdmin = b.isAdmin;
+    if(typeof b.isAdmin === 'boolean' && ctx.isSuper) record.isAdmin = b.isAdmin; // 관리자 권한은 최고 관리자만
     if(id === ctx.uid) record.isAdmin = true; // 스스로 관리자 권한을 잃지 않게
+    if(!record.isAdmin) delete record.isSuper;
     delete record.pwHash; delete record.pwSalt; delete record.password;
     const updates = { [USERS + '/' + newId]: record, [USERS + '/' + id]: null, [SECRET_AUTH + '/' + id]: null, [SECRET_AUTH + '/' + newId]: sS.val() };
     const pw = cleanPw(b.pw);
@@ -78,6 +86,7 @@ module.exports = handler(async (req, b) => {
     const users = (await d.ref(USERS).once('value')).val() || {};
     const user = users[id];
     if(!user) throw httpErr(404, '없는 계정이에요.');
+    guardTarget(ctx, user);
     const updates = { [USERS + '/' + id]: null, [SECRET_AUTH + '/' + id]: null, [PLAYERS + '/' + id]: null, ['allthing-secret/fails/' + id]: null };
     const no = user.studentNo;
     if(no && validId(String(no)) && !Object.keys(users).some(k => k !== id && (users[k] || {}).studentNo === no)) updates[TIMETABLES + '/' + no] = null;

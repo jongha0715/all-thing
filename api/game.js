@@ -3,7 +3,7 @@
    주식게임에서 돈·주식·아이템이 바뀌는 일은 전부 여기서만 일어나요.
    데이터베이스 규칙상 친구들 기기는 게임 데이터를 읽기만 할 수 있어요. */
 const fb = require('./_lib/fb');
-const { handler, httpErr, requireUser, requireAdmin, txn, USERS } = require('./_lib/http');
+const { handler, httpErr, requireUser, requireAdmin, requireSuper, txn, USERS } = require('./_lib/http');
 const { hashPassword } = require('./_lib/pw');
 const E = require('./_lib/engine');
 
@@ -365,12 +365,40 @@ async function findOrphans(d){
   return Object.keys(p.val() || {}).filter(id => !users[id]);
 }
 
+/* ---------- 최고 관리자: 돈 넣기·빼기 (사유는 거래내역에 남아요) ---------- */
+async function doAdjustCash(d, ctx, ctrl, b){
+  const id = String(b.id || '');
+  const amount = Math.round(Number(b.amount));
+  const reason = String(b.reason || '').trim().replace(/\s+/g, ' ');
+  if(!id) throw httpErr(400, '대상을 골라주세요.');
+  if(!Number.isFinite(amount) || amount === 0) throw httpErr(400, '금액을 입력해주세요. (빼려면 앞에 - 를 붙여요)');
+  if(Math.abs(amount) > 100000000) throw httpErr(400, '한 번에 1억 원까지만 넣거나 뺄 수 있어요.');
+  if(!reason) throw httpErr(400, '사유를 적어주세요.');
+  if(reason.length > 100) throw httpErr(400, '사유는 100자까지 적을 수 있어요.');
+  const target = (await d.ref(USERS + '/' + id).once('value')).val();
+  if(!target) throw httpErr(404, '없는 계정이에요.');
+  let err = '', after = 0;
+  const res = await txn(playerRef(d, id), cur => {
+    err = '';
+    if(!cur) cur = E.playerDefaults();
+    const next = (cur.cash || 0) + amount;
+    if(next < 0){ err = '현금이 부족해서 뺄 수 없어요. (지금 현금 ' + fmtWon(cur.cash || 0) + ')'; return undefined; }
+    cur.cash = next; after = next;
+    return cur;
+  });
+  if(err) throw httpErr(400, err);
+  if(!res.committed) throw httpErr(409, '처리하지 못했어요. 잠시 후 다시 시도해주세요.');
+  await gameLog(d, ctrl, id, { type:'adjust', amount, reason, by: ctx.uid });
+  return { message: (target.displayName || id) + '에게 ' + (amount > 0 ? fmtWon(amount) + ' 넣었어요' : fmtWon(-amount) + ' 뺐어요') + ' · 지금 현금 ' + fmtWon(after) };
+}
+
 module.exports = handler(async (req, b) => {
   const ctx = await requireUser(req);
   const d = fb.db();
   const action = String(b.action || '');
   const ctrl = await loadCtrl(d);
 
+  if(action === 'adjustCash'){ requireSuper(ctx); return doAdjustCash(d, ctx, ctrl, b); }
   if(action === 'control' || action === 'reset' || action === 'orphans' || action === 'cleanup'){
     requireAdmin(ctx);
     if(action === 'control') return doControl(d, ctrl, lazyEvents(d), b);
