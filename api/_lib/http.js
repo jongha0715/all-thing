@@ -7,7 +7,7 @@ function httpErr(status, message){ const e = new Error(message); e.status = stat
 function send(res, status, obj){
   res.statusCode = status;
   res.setHeader('Content-Type', 'application/json; charset=utf-8');
-  res.setHeader('Cache-Control', 'no-store');
+  if(!(res.getHeader && res.getHeader('Cache-Control'))) res.setHeader('Cache-Control', 'no-store');
   res.end(JSON.stringify(obj));
 }
 async function readBody(req){
