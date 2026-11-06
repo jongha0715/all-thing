@@ -97,12 +97,6 @@ a{ color: var(--aqua); }
 .crown-ic{ color: var(--warm); width:15px; height:15px; vertical-align:-2px; }
 .super-badge{ display:inline-flex; align-items:center; gap:3px; color: var(--warm); background: rgba(184,117,46,.12); border-color: rgba(184,117,46,.28); }
 .cash-adjust .field{ margin-bottom:10px; }
-.widget-card .widget-buttons{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:8px; }
-.widget-card #widgetUrl{ font-size:12px; }
-.widget-help{ margin-top:6px; font-size:13.5px; }
-.widget-help summary{ cursor:pointer; font-weight:700; color: var(--text-2); padding:4px 0; }
-.widget-help ol{ margin:4px 0 10px; padding-left:20px; line-height:1.6; }
-.widget-help p{ margin:8px 0 2px; }
 .cash-adjust .cash-buttons{ display:flex; gap:8px; flex-wrap:wrap; }
 
 /* ---------- buttons & inputs ---------- */
@@ -1913,7 +1907,6 @@ async function handleLogout(){
   if(state.game) stopGameSync();
   stopRealtimeSync();
   state.currentUser = null;
-  state.widget = null;
   state.view = 'home';
   state.splashPlayed = false;
   await sDel('allthing-session', false);
@@ -3121,173 +3114,8 @@ function renderProfileView(){
 
   ${renderNotificationCard()}
 
-  ${renderWidgetCard()}
-
   <button class="btn btn-ghost btn-block logout-btn" data-act="logout">${icon('logout')} 로그아웃</button>
   `;
-}
-/* ---------- 홈 화면 위젯 ----------
-   위젯 열쇠로 만든 나만의 주소를 아이폰(Scriptable)이나 갤럭시 위젯 앱에 넣으면,
-   오늘 급식·시간표·다가오는 수행평가·내 주식 총자산이 홈 화면에 보여요. 위젯은 읽기만 할 수 있어요. */
-function widgetUrl(key){ return location.origin + '/api/widget?k=' + key; }
-function renderWidgetCard(){
-  const w = state.widget || (state.widget = { loaded:false, key:null, busy:false });
-  if(!w.loaded && !w.loading){ w.loading = true; api('account', { action:'widgetKeyGet' }).then(r => { w.key = r.key; }).catch(() => {}).finally(() => { w.loaded = true; w.loading = false; if(state.view === 'profile') render(); }); }
-  const url = w.key ? widgetUrl(w.key) : '';
-  return `
-  <div class="card widget-card">
-    <h3>📱 홈 화면 위젯</h3>
-    <p class="text-2">오늘 급식, 시간표, 다가오는 수행평가, 내 주식 총자산을 휴대폰·패드 홈 화면에서 바로 볼 수 있어요.</p>
-    ${!w.loaded ? `<p class="text-3 small">불러오는 중…</p>` : !w.key ? `
-      <button class="btn btn-primary btn-block" data-act="widgetKeyNew">위젯 주소 만들기</button>` : `
-      <label class="field"><span>내 위젯 주소 (다른 사람에게 알려주지 마세요)</span>
-        <input id="widgetUrl" type="text" readonly value="${esc(url)}">
-      </label>
-      <div class="widget-buttons">
-        <button class="btn btn-primary btn-sm" data-act="widgetCopyUrl">주소 복사 (갤럭시)</button>
-        <button class="btn btn-primary btn-sm" data-act="widgetCopyScript">아이폰용 스크립트 복사</button>
-        <button class="btn btn-ghost btn-sm danger" data-act="widgetKeyNew">새 주소로 바꾸기</button>
-      </div>
-      <details class="widget-help">
-        <summary>설치 방법 보기</summary>
-        <p><b>아이폰·아이패드</b></p>
-        <ol>
-          <li>앱스토어에서 무료 앱 <b>Scriptable</b>을 설치해요.</li>
-          <li>위의 <b>아이폰용 스크립트 복사</b>를 눌러요.</li>
-          <li>Scriptable을 열고 오른쪽 위 <b>＋</b>를 눌러 붙여넣은 뒤, 위쪽 제목을 <b>All thing</b>으로 바꾸고 <b>완료</b>를 눌러요.</li>
-          <li>홈 화면을 길게 눌러 <b>편집 → 위젯 추가 → Scriptable</b>에서 원하는 크기를 골라 추가해요.</li>
-          <li>추가된 위젯을 길게 눌러 <b>위젯 편집 → Script</b>에서 <b>All thing</b>을 골라요.</li>
-        </ol>
-        <p><b>갤럭시 (휴대폰·탭)</b></p>
-        <ol>
-          <li>반장이 나눠준 <b>All thing 위젯</b> 앱을 설치해요.</li>
-          <li>위의 <b>주소 복사</b>를 누르고, 위젯 앱을 열어 붙여넣고 <b>저장</b>을 눌러요.</li>
-          <li>홈 화면을 길게 눌러 <b>위젯 → All thing</b>을 추가해요.</li>
-        </ol>
-        <p class="text-3 small">위젯은 30분마다 새로고침돼요. 주소가 남에게 알려졌다면 <b>새 주소로 바꾸기</b>를 누르세요. 예전 주소는 바로 막히고, 위젯에 새 주소를 다시 넣어야 해요.</p>
-      </details>`}
-  </div>`;
-}
-async function widgetKeyNew(){
-  const w = state.widget || (state.widget = {});
-  if(w.key && !confirm('새 주소로 바꾸면 지금 쓰는 위젯은 멈춰요. 위젯에 새 주소(또는 새 스크립트)를 다시 넣어야 해요. 바꿀까요?')) return;
-  if(w.busy) return;
-  w.busy = true;
-  const r = await apiToast('account', { action:'widgetKeyNew' });
-  w.busy = false;
-  if(!r) return;
-  w.key = r.key; w.loaded = true;
-  showToast(w.key ? '위젯 주소를 만들었어요.' : '');
-}
-async function copyText(text, okMsg){
-  try{ await navigator.clipboard.writeText(text); showToast(okMsg); }
-  catch(e){
-    const ta = document.createElement('textarea'); ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta); ta.select();
-    let ok = false; try{ ok = document.execCommand('copy'); }catch(e2){}
-    ta.remove();
-    showToast(ok ? okMsg : '복사하지 못했어요. 주소 칸을 길게 눌러 직접 복사해주세요.', ok ? undefined : 'err');
-  }
-}
-function widgetCopyUrl(){ const w = state.widget || {}; if(w.key) copyText(widgetUrl(w.key), '위젯 주소를 복사했어요. 위젯 앱에 붙여넣으세요.'); }
-function widgetCopyScript(){ const w = state.widget || {}; if(w.key) copyText(scriptableScript(widgetUrl(w.key)), '아이폰용 스크립트를 복사했어요. Scriptable에 붙여넣으세요.'); }
-/* 아이폰·아이패드용 Scriptable 스크립트 (주소가 들어간 채로 복사돼요) */
-function scriptableScript(url){
-  return `// All thing 홈 화면 위젯 (Scriptable)
-// 이 스크립트에는 나만의 위젯 주소가 들어 있어요. 다른 사람에게 보내지 마세요.
-const WIDGET_URL = ${JSON.stringify(url)};
-
-const C = { bg: new Color("#1d1f22"), card: new Color("#2a2d31"), text: new Color("#f2f2ef"),
-            dim: new Color("#a7aaa3"), accent: new Color("#c9d08e"), up: new Color("#ff6b6b"), down: new Color("#5aa9ff") };
-
-async function load(){
-  try{
-    const r = new Request(WIDGET_URL);
-    r.timeoutInterval = 15;
-    const d = await r.loadJSON();
-    if(d && d.ok) Keychain.set("allthing-widget-cache", JSON.stringify(d));
-    return d;
-  }catch(e){
-    // 인터넷이 안 되면 마지막으로 받은 내용을 보여줘요
-    if(Keychain.contains("allthing-widget-cache")){
-      const d = JSON.parse(Keychain.get("allthing-widget-cache")); d.updated = (d.updated || "") + " · 오프라인"; return d;
-    }
-    return { ok:false, error:"인터넷에 연결되지 않았어요" };
-  }
-}
-function txt(stack, s, size, color, bold, lines){
-  const t = stack.addText(String(s == null ? "" : s));
-  t.font = bold ? Font.boldSystemFont(size) : Font.systemFont(size);
-  t.textColor = color || C.text;
-  t.lineLimit = lines || 1;
-  t.minimumScaleFactor = 0.75;
-  return t;
-}
-function section(stack, title, body, lines, bodyColor){
-  const s = stack.addStack(); s.layoutVertically(); s.spacing = 2;
-  txt(s, title, 11, C.accent, true);
-  txt(s, body, 12, bodyColor || C.text, false, lines);
-  return s;
-}
-function header(w, d){
-  const h = w.addStack(); h.centerAlignContent();
-  txt(h, "All thing", 13, C.accent, true);
-  h.addSpacer();
-  txt(h, d.date || "", 11, C.dim);
-}
-function stockColor(d){ return d.stockUp === true ? C.up : d.stockUp === false ? C.down : C.text; }
-
-const d = await load();
-const w = new ListWidget();
-w.backgroundColor = C.bg;
-w.setPadding(12, 14, 12, 14);
-w.url = (d && d.url) || "https://ali-thing.vercel.app/";
-w.refreshAfterDate = new Date(Date.now() + 30 * 60 * 1000);
-const fam = config.widgetFamily || "large";
-
-if(!d || !d.ok){
-  txt(w, "All thing", 14, C.accent, true);
-  w.addSpacer(6);
-  txt(w, (d && d.error) || "불러오지 못했어요", 12, C.up, false, 4);
-} else if(fam === "small"){
-  header(w, d);
-  w.addSpacer(6);
-  section(w, d.mealTitle, d.mealText, 3);
-  w.addSpacer(6);
-  section(w, "내 주식", d.stockText, 2, stockColor(d));
-  w.addSpacer();
-  txt(w, d.updated, 9, C.dim);
-} else if(fam === "medium"){
-  header(w, d);
-  w.addSpacer(6);
-  const row = w.addStack(); row.spacing = 12; row.topAlignContent();
-  const left = row.addStack(); left.layoutVertically(); left.spacing = 6;
-  const right = row.addStack(); right.layoutVertically(); right.spacing = 6;
-  section(left, d.ttTitle, d.ttText, 4);
-  section(right, d.mealTitle, d.mealText, 3);
-  section(right, "내 주식", d.stockText, 1, stockColor(d));
-  w.addSpacer();
-  txt(w, d.updated, 9, C.dim);
-} else {
-  header(w, d);
-  w.addSpacer(8);
-  section(w, d.ttTitle, d.ttText, 3);
-  w.addSpacer(8);
-  section(w, d.mealTitle, d.mealText, 3);
-  w.addSpacer(8);
-  section(w, "다가오는 수행평가·시험", d.examText, 3);
-  w.addSpacer(8);
-  section(w, "내 주식", d.stockText, 1, stockColor(d));
-  w.addSpacer();
-  txt(w, d.updated, 9, C.dim);
-}
-
-if(config.runsInWidget) Script.setWidget(w);
-else if(fam === "small") await w.presentSmall();
-else if(fam === "medium") await w.presentMedium();
-else await w.presentLarge();
-Script.complete();
-`;
 }
 function renderNotificationCard(){
   if(typeof Notification === 'undefined') return '';
@@ -3858,9 +3686,6 @@ function bindEvents(){
       case 'acctDelete': acctDelete(el.dataset.id); break;
       case 'cleanupOrphans': cleanupOrphanGameData(); break;
       case 'cashAdjust': submitCashAdjust(Number(el.dataset.sign)); break;
-      case 'widgetKeyNew': widgetKeyNew(); break;
-      case 'widgetCopyUrl': widgetCopyUrl(); break;
-      case 'widgetCopyScript': widgetCopyScript(); break;
       case 'gameToggleOpen': gameToggleOpen(); break;
       case 'gameToggleTest': gameToggleTest(); break;
       case 'gameToggleTester': gameToggleTester(el.dataset.id); break;
