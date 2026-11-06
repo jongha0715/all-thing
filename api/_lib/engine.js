@@ -18,28 +18,35 @@ function hmToMin(str){ const p = str.split(':').map(Number); return p[0] * 60 + 
 
 const GAME_TICK_MS = 30 * 60 * 1000;
 const GAME_START_CASH = 1000000;
-const GAME_DAILY_CASH = 100000;
+const GAME_DAILY_CASH = 30000;   // 2026-11 개편: 10만 → 3만 (출석만으로 순위가 정해지지 않게)
 const GAME_HISTORY_LEN = 48;
 const GAME_STOCKS = [
   { id:'meal',    name:'급식컴퍼니',     type:'안정형', sector:'식품',   vol:0.012, base:10000 },
   { id:'library', name:'도서관미디어',   type:'안정형', sector:'미디어', vol:0.016, base:15000 },
-  { id:'store',   name:'매점전자',       type:'성장형', sector:'전자',   vol:0.026, base:20000 },
-  { id:'gym',     name:'체육관건설',     type:'고위험', sector:'건설',   vol:0.048, base:8000 },
-  { id:'break',   name:'쉬는시간게임즈', type:'테마형', sector:'게임',   vol:0.032, base:5000, jump:true }
+  { id:'store',   name:'매점전자',       type:'성장형', sector:'전자',   vol:0.026, base:20000, news:1.4 }, // 뉴스에 가장 민감
+  { id:'gym',     name:'체육관건설',     type:'고위험', sector:'건설',   vol:0.034, base:8000 },
+  { id:'break',   name:'쉬는시간게임즈', type:'테마형', sector:'게임',   vol:0.024, base:5000, jump:true }
 ];
 const GAME_ITEMS = [
   { id:'autoOrder', name:'자동 손절·익절 예약권', price:30000, dailyLimit:3 },
-  { id:'newsSummary', name:'뉴스 요약', price:20000, dailyLimit:5 },
-  { id:'lotto', name:'로또', price:30000, dailyLimit:3, instant:true }
+  { id:'newsSummary', name:'뉴스 요약', price:10000, dailyLimit:5 },
+  { id:'lotto', name:'로또', price:30000, dailyLimit:5, instant:true }
 ];
-// 평균 당첨금 ≈ 27,100원 / 30,000원 (90%)
+// 평균 당첨금 ≈ 28,400원 / 30,000원 (약 95%) — 100%를 넘으면 "로또만 하는 게 정답"이 돼서 넘기지 않아요
 const LOTTO_PRIZES = [
   { tier:'jackpot', label:'🎉 대박!!',    amount:1000000, p:0.005 },
   { tier:'big',     label:'💰 거액 당첨', amount:300000,  p:0.035 },
-  { tier:'mid',     label:'✨ 중액 당첨', amount:60000,   p:0.11 },
-  { tier:'small',   label:'🙂 소액 당첨', amount:20000,   p:0.25 },
-  { tier:'lose',    label:'😢 꽝',        amount:0,       p:0.60 }
+  { tier:'mid',     label:'✨ 중액 당첨', amount:60000,   p:0.115 },
+  { tier:'small',   label:'🙂 소액 당첨', amount:20000,   p:0.30 },
+  { tier:'lose',    label:'😢 꽝',        amount:0,       p:0.545 }
 ];
+/* ---- 배당 (안정형 종목) ----
+   매일 16:30에 들고 있는 급식컴퍼니·도서관미디어 주식 가치의 0.3%를 현금으로 줘요.
+   단, 어제 16:30과 오늘 16:30에 "둘 다" 들고 있던 수량에만 줘요 (잠깐 샀다 파는 꼼수 방지). */
+const DIV_RATE = 0.003;
+const DIV_STOCKS = ['meal', 'library'];
+const DIV_MIN = 16 * 60 + 30;
+const DIV_MAX_DAYS = 14;
 function drawLotto(rand){
   let r = (rand || Math.random)();
   for(const pz of LOTTO_PRIZES){ if(r < pz.p) return pz; r -= pz.p; }
@@ -127,10 +134,23 @@ const STORY_NODES = {
   x6:  { fx:{ meal:1, library:1, store:1, gym:1, break:1 }, str:0.7, emoji:'💰', title:'학교 예산이 늘어난다', next:[],
          body:'내년 학교 예산이 크게 늘어난다는 소식이 전해졌다. 여기저기서 "이번엔 뭐가 바뀔까" 하는 기대가 나온다.' },
   x7:  { fx:{ meal:-1, library:-1, store:-1, gym:-1, break:-1 }, str:0.7, emoji:'🌀', title:'태풍 북상… "다음 주 휴업할 수도"', next:[],
-         body:'큰 태풍이 올라오면서 다음 주 휴업 가능성까지 거론되고 있다. 학교 전체가 뒤숭숭하다.' }
+         body:'큰 태풍이 올라오면서 다음 주 휴업 가능성까지 거론되고 있다. 학교 전체가 뒤숭숭하다.' },
+  // 2026-11 개편: 종목마다 호재·악재가 비슷하게 나오도록 추가한 단독 기사
+  y1:  { stock:'meal', dir:-1, str:1.4, emoji:'🧊', title:'급식실 냉장고가 멈췄다', next:[],
+         body:'밤사이 급식실 대형 냉장고가 고장 났다는 소식이다. 오늘 메뉴 일부가 바뀔 수 있다는 안내가 붙었다.' },
+  y2:  { stock:'store', dir:-1, str:0.6, emoji:'🔌', title:'"충전이 안 돼요"… 매점 충전기 불량 소문', next:[],
+         body:'매점에서 산 충전기가 금방 고장 났다는 이야기가 반마다 돌고 있다. 매점은 "일부 제품만 그렇다"고 해명했다.' },
+  y3:  { stock:'library', dir:-1, str:0.5, emoji:'🔨', title:'도서관, 다음 주 열람실 일부 공사', next:[],
+         body:'다음 주부터 도서관 열람실 절반이 공사로 문을 닫는다는 공지가 붙었다. 자리가 부족해질 것 같다.' },
+  y4:  { stock:'gym', dir:-1, str:1.05, emoji:'🚧', title:'"공사 소음 때문에 수업이 안 돼요"', next:[],
+         body:'운동장 쪽 공사 소음에 대한 민원이 잇따르고 있다. 학교는 공사 시간을 줄이는 방안을 검토 중이라고 한다.' },
+  y5:  { stock:'break', dir: 1, str:1.45, emoji:'📺', title:'유명 스트리머가 그 게임을 했다', next:[],
+         body:'어젯밤 구독자 많은 스트리머가 방송에서 그 게임을 한참 동안 했다. 오늘 아침부터 반마다 그 이야기뿐이다.' },
+  y6:  { stock:'meal', dir:-1, str:1.4, emoji:'🥬', title:'채소값이 크게 올랐다', next:[],
+         body:'뉴스에서 채소와 과일값이 크게 올랐다는 소식이 나왔다. 급식 반찬이 바뀔 수도 있다는 이야기가 나온다.' }
 };
 const STORY_STARTS = ['m1','s1','l1','g1','b1','w1'];
-const STORY_SINGLES = ['x1','x2','x3','x4','x5','x6','x7'];
+const STORY_SINGLES = ['x1','x2','x3','x4','x5','x6','x7','y1','y2','y3','y4','y5','y6'];
 const KR_PUBLIC_HOLIDAYS = new Set([
   '2026-10-05','2026-10-09','2026-12-25',
   '2027-01-01','2027-02-06','2027-02-07','2027-02-08','2027-02-09','2027-03-01',
@@ -198,6 +218,7 @@ function pickStory(tickNo, arcs, rand){
   return STORY_SINGLES[Math.floor(rand() * STORY_SINGLES.length)];
 }
 const GAME_TREND_STEPS = 6;
+const SHOCK_WEIGHTS = [0.45, 0.35, 0.2];
 const FLOW_DEPTH = 50000000;
 const TREND_K = 0.6;
 const TREND_NOISE = 0.9;
@@ -229,6 +250,7 @@ function makeNewsEvent(tickNo, arcs, nodeIdOverride){
     if(node.next && node.next.length) nextArcs[node.arc] = { node: nodeId, tick: tickNo, run };
     else delete nextArcs[node.arc];
   }
+  effects.forEach(e => { const st = stockInfo(e.stock); if(st && st.news) e.shock *= st.news; }); // 매점전자는 뉴스에 1.4배 민감
   return {
     effects, arcs: nextArcs,
     record: { id: recId, tick: tickNo, at: tickNo * GAME_TICK_MS, node: nodeId, emoji: node.emoji, title: node.title, body: node.body,
@@ -246,7 +268,8 @@ function stepPrice(stock, price, trend, flowR){
   const noise = gaussRand() * stock.vol * (trend ? TREND_NOISE : 1);
   const revert = ((stock.base - price) / stock.base) * (trend ? 0.004 : 0.02);
   let r = noise + drift + revert + (flowR || 0);
-  if(stock.jump && !trend && Math.random() < 0.07) r += (Math.random() < 0.5 ? -1 : 1) * (0.08 + Math.random() * 0.12);
+  if(trend && trend.sh && trend.w) r += trend.sh * trend.w; // 뉴스 충격이 나눠서 반영되는 부분
+  if(stock.jump && !trend && Math.random() < 0.04) r += (Math.random() < 0.5 ? -1 : 1) * (0.06 + Math.random() * 0.08);
   return clampPrice(stock, price * (1 + r));
 }
 
@@ -301,16 +324,19 @@ function advanceMarket(m, target, extFlow, events, nowMs){
     }
     prev = prices;
     const next = {};
+    // 뉴스 충격은 기사가 나온 뒤 30분마다 45% → 35% → 20%로 나눠서 반영돼요 (뉴스를 먼저 읽은 사람이 이득)
+    GAME_STOCKS.forEach(s => { const t = trend[s.id]; if(t && t.sh){ t.w = SHOCK_WEIGHTS[t.step || 0] || 0; t.step = (t.step || 0) + 1; } });
     GAME_STOCKS.forEach(s => { next[s.id] = stepPrice(s, prev[s.id], trend[s.id], flowImpact(flow[s.id])); });
+    GAME_STOCKS.forEach(s => { const t = trend[s.id]; if(t && t.sh){ delete t.w; if(t.step >= SHOCK_WEIGHTS.length){ delete t.sh; delete t.step; } } });
     Object.keys(flow).forEach(k => delete flow[k]);
     Object.keys(trend).forEach(k => { trend[k].left -= 1; trend[k].k *= 0.8; if(trend[k].left <= 0) delete trend[k]; });
     if(isNewsSlot(tickNo, events) && Math.random() < GAME_NEWS_PROB){
       const ev = makeNewsEvent(tickNo, arcs);
       arcs = ev.arcs;
       ev.effects.forEach(ef => {
-        const st = stockInfo(ef.stock);
-        next[ef.stock] = clampPrice(st, next[ef.stock] * (1 + ef.shock));
-        trend[ef.stock] = { d: ef.dir, k: ef.k, left: GAME_TREND_STEPS, n: ev.record.id };
+        // 앞 뉴스의 충격이 아직 남아 있으면 이어서 반영해요
+        const old = trend[ef.stock], rest = (old && old.sh) ? old.sh * SHOCK_WEIGHTS.slice(old.step || 0).reduce((a, b) => a + b, 0) : 0;
+        trend[ef.stock] = { d: ef.dir, k: ef.k, left: GAME_TREND_STEPS + SHOCK_WEIGHTS.length, n: ev.record.id, sh: ef.shock + rest, step: 0 };
       });
       news.push(ev.record);
     }
@@ -398,10 +424,33 @@ function ctrlOf(raw){ return Object.assign({}, GAME_CTRL_DEFAULT, raw || {}); }
 function marketRunning(c){ return !!(c.open || c.test); }
 function canPlay(c, uid, isAdmin){ if(c.open) return true; return !!c.test && (isAdmin || !!(c.testers || {})[uid]); }
 
+/* ---- 배당 정산 ----
+   보유 수량은 서버에서만 바뀌니까, 수량이 바뀌기 직전(매매·자동 매도)과 접속할 때마다 이 함수를 먼저 불러요.
+   그러면 "지난 정산 이후 지나간 16:30마다 들고 있던 수량 = 지금 수량"이라서 정확하게 계산할 수 있어요. */
+function divSnapIndex(ms){ return Math.floor((ms + KST_OFFSET - DIV_MIN * 60000) / 86400000); }
+function settleDividend(p, prices, nowMs){
+  const cur = divSnapIndex(nowMs || Date.now());
+  const h = {}; DIV_STOCKS.forEach(id => { h[id] = ((p.holdings || {})[id]) || 0; });
+  const d = p.div;
+  if(!d || typeof d.s !== 'number'){ p.div = { s: cur, q: h }; return { amount: 0, days: 0 }; }
+  if(cur <= d.s) return { amount: 0, days: 0 };
+  let amount = 0, prevQ = Object.assign({}, d.q || {});
+  const days = Math.min(cur - d.s, DIV_MAX_DAYS);
+  for(let i = 0; i < days; i++){
+    DIV_STOCKS.forEach(id => { const q = Math.min(prevQ[id] || 0, h[id]); amount += q * ((prices || {})[id] || 0) * DIV_RATE; });
+    prevQ = h;
+  }
+  amount = Math.floor(amount);
+  if(amount > 0) p.cash = (p.cash || 0) + amount;
+  p.div = { s: cur, q: h };
+  return { amount, days };
+}
+
 module.exports = {
   KST_OFFSET, kst, pad2, todayStr, dateKeyMs, GAME_TICK_MS, GAME_START_CASH, GAME_DAILY_CASH, GAME_HISTORY_LEN,
   GAME_STOCKS, GAME_ITEMS, LOTTO_PRIZES, drawLotto, LEGACY_ITEMS, STORY_NODES, NEWS_DONE_TTL_MS, NEWS_DONE_AFTER, NEWS_MAX,
   holidayInfo, isFrozenTick, isNewsSlot, marketStatus, stockInfo, stockName, makeNewsEvent, tickNow, clampPrice,
   flowImpact, advanceMarket, fastForward, pruneNews, newsIsRunning, publicMarket, newsAnalysis, playerDefaults,
-  execPrice, findOrderTriggers, GAME_TREND_STEPS, ctrlOf, marketRunning, canPlay, freshEngine
+  execPrice, findOrderTriggers, GAME_TREND_STEPS, ctrlOf, marketRunning, canPlay, freshEngine,
+  DIV_RATE, DIV_STOCKS, settleDividend, divSnapIndex, SHOCK_WEIGHTS
 };
