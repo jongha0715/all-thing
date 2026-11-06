@@ -103,13 +103,18 @@ async function doSync(d, ctx, ctrl, ev){
   const sums = (pNow && pNow.summaries) || {};
   const needNews = Object.keys(sums).length > 0 && (advanced || Object.keys(sums).some(k => typeof sums[k] !== 'object'));
   const news = advanced ? advanced.news : (needNews ? await readEnginePart(d, 'news') : null);
+  const prices = advanced ? advanced.prices : (await readEnginePart(d, 'prices')) || {}; // 배당 계산용 (값 5개라 아주 작아요)
   const newsById = {};
   ((news) ? (Array.isArray(news) ? news : Object.values(news)) : []).forEach(n => { if(n && n.node) newsById[n.id] = n; });
-  let created = false, granted = false, refund = 0;
+  let created = false, granted = false, refund = 0, div = null;
   const r1 = await txn(playerRef(d, ctx.uid), cur => {
-    created = false; granted = false; refund = 0;
-    if(!cur){ created = true; return E.playerDefaults(); }
+    created = false; granted = false; refund = 0; div = null;
+    if(!cur){ created = true; const p = E.playerDefaults(); E.settleDividend(p, prices); return p; }
     let changed = false;
+    // 배당: 지난 접속 이후 지나간 16:30마다 계산해서 현금으로 넣어요
+    const hadDiv = !!cur.div;
+    div = E.settleDividend(cur, prices);
+    if(!hadDiv || div.days > 0) changed = true;
     // 예전 버전에서 연 요약(값이 1)은 새 형식으로 바꿔 주고, 정리된 기사의 요약은 지워요
     if(cur.summaries && news){
       const next = {};
@@ -132,6 +137,7 @@ async function doSync(d, ctx, ctrl, ev){
     if(created){ messages.push('주식게임 시작! 시작 자금 ' + fmtWon(E.GAME_START_CASH) + '을 받았어요.'); await gameLog(d, ctrl, ctx.uid, { type:'start', amount: E.GAME_START_CASH }); }
     else if(granted){ messages.push('오늘의 지원금 ' + fmtWon(E.GAME_DAILY_CASH) + '을 받았어요.'); await gameLog(d, ctrl, ctx.uid, { type:'allowance', amount: E.GAME_DAILY_CASH }); }
     if(refund){ messages.push('힌트 아이템이 사라져서, 안 쓴 힌트 값 ' + fmtWon(refund) + '을 돌려드렸어요.'); await gameLog(d, ctrl, ctx.uid, { type:'refund', amount: refund }); }
+    if(div && div.amount > 0){ messages.push('💰 배당 ' + fmtWon(div.amount) + '을 받았어요. (급식컴퍼니·도서관미디어)'); await gameLog(d, ctrl, ctx.uid, { type:'dividend', amount: div.amount, days: div.days }); }
   }
   // 자동 손절·익절: 조건을 처음 만족한 30분 칸의 가격으로 팔아요 (앱을 늦게 열어도 결과가 같아요)
   let eng = advanced;
@@ -146,6 +152,7 @@ async function doSync(d, ctx, ctrl, ev){
       if(!cur || !cur.orders) return undefined;
       const hits = E.findOrderTriggers(cur.orders, eng);
       if(!hits.length) return undefined;
+      E.settleDividend(cur, prices); // 수량이 바뀌기 전에 배당부터 정산
       cur.holdings = cur.holdings || {}; cur.cost = cur.cost || {}; cur.items = cur.items || {};
       hits.forEach(h => {
         const o = cur.orders[h.id]; delete cur.orders[h.id];
@@ -183,13 +190,15 @@ async function doTrade(d, ctx, ctrl, ev, b){
     if(!st.open) throw httpErr(400, '수업 시간에는 매수할 수 없어요 (매도는 가능해요). ' + st.reopen + '에 다시 열려요.');
   }
   const eng = await advance(d, ev);
-  const price = await currentPrice(d, eng, stock.id);
+  const prices = (eng && eng.prices) || (await readEnginePart(d, 'prices')) || {};
+  const price = prices[stock.id];
   if(!(price > 0)) throw httpErr(503, '시세를 확인할 수 없어요.');
   const fill = E.execPrice(side, price, qty);
-  let err = '';
+  let err = '', div = null;
   const res = await txn(playerRef(d, ctx.uid), cur => {
-    err = '';
+    err = ''; div = null;
     if(!cur) cur = E.playerDefaults();
+    div = E.settleDividend(cur, prices); // 수량이 바뀌기 전에 배당부터 정산
     cur.holdings = cur.holdings || {}; cur.cost = cur.cost || {};
     const have = cur.holdings[stock.id] || 0;
     if(side === 'buy'){
@@ -214,8 +223,9 @@ async function doTrade(d, ctx, ctrl, ev, b){
   if(err) throw httpErr(400, err);
   if(!res.committed) throw httpErr(409, '거래하지 못했어요. 잠시 후 다시 시도해주세요.');
   await recordFlow(d, stock.id, (side === 'buy' ? 1 : -1) * fill * qty);
+  if(div && div.amount > 0) await gameLog(d, ctrl, ctx.uid, { type:'dividend', amount: div.amount, days: div.days });
   await gameLog(d, ctrl, ctx.uid, { type: side, stock: stock.id, qty, price: fill });
-  return { message: stock.name + ' ' + qty + '주 ' + (side === 'buy' ? '매수' : '매도') + ' 완료 · 체결가 ' + fmtWon(fill) };
+  return { message: stock.name + ' ' + qty + '주 ' + (side === 'buy' ? '매수' : '매도') + ' 완료 · 체결가 ' + fmtWon(fill) + (div && div.amount > 0 ? ' · 💰 배당 ' + fmtWon(div.amount) + '도 받았어요' : '') };
 }
 
 /* ---------- 상점 (로또 추첨도 서버에서) ---------- */
